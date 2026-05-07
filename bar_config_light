@@ -1,0 +1,18 @@
+bar {
+        status_command i3status
+	tray_output primary
+
+        # Define a color block for the light theme
+        colors {
+            background #eeeeee      # Light gray background
+            statusline #000000      # Black text info (clock, date, volume)
+            separator  #666666      # Dark gray separator lines
+
+            #                    border  backgr. text
+            focused_workspace    #4c7899 #a0a0a0 #000000
+            active_workspace     #333333 #d0d0d0 #333333
+            inactive_workspace   #333333 #eeeeee #333333
+            urgent_workspace     #2f343a #900000 #ffffff
+            binding_mode         #2f343a #900000 #ffffff
+        }
+}

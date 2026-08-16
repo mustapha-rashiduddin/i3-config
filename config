@@ -45,60 +45,60 @@ bindsym $mod+b floating toggle
 # change focus between tiling / floating windows
 bindsym $mod+space focus mode_toggle
 
-set $ws1 "1"
-set $ws2 "2"
-set $ws3 "3"
-set $ws4 "4"
-set $ws5 "5"
-set $ws6 "6"
-set $ws7 "7"
-set $ws8 "8"
-set $ws9 "9"
-set $ws10 "10"
-set $ws11 "11"
-set $ws12 "12"
-set $ws13 "13"
-set $ws14 "14"
-set $ws15 "15"
-set $ws16 "16"
+set $ws1 "j"
+set $ws2 "k"
+set $ws3 "l"
+set $ws4 ";"
+set $ws5 "m"
+set $ws6 ","
+set $ws7 "."
+set $ws8 "/"
+set $ws9 "a"
+set $ws10 "s"
+set $ws11 "d"
+set $ws12 "f"
+set $ws13 "z"
+set $ws14 "x"
+set $ws15 "c"
+set $ws16 "v"
 
 # switch to workspace
-bindsym $mod+j workspace number $ws1
-bindsym $mod+k workspace number $ws2
-bindsym $mod+l workspace number $ws3
-bindsym $mod+semicolon workspace number $ws4
-bindsym $mod+m workspace number $ws5
-bindsym $mod+comma workspace number $ws6
-bindsym $mod+period workspace number $ws7
-bindsym $mod+slash workspace number $ws8
+bindsym $mod+j workspace $ws1
+bindsym $mod+k workspace $ws2
+bindsym $mod+l workspace $ws3
+bindsym $mod+semicolon workspace $ws4
+bindsym $mod+m workspace $ws5
+bindsym $mod+comma workspace $ws6
+bindsym $mod+period workspace $ws7
+bindsym $mod+slash workspace $ws8
 
-bindsym $mod+a workspace number $ws9
-bindsym $mod+s workspace number $ws10
-bindsym $mod+d workspace number $ws11
-bindsym $mod+f workspace number $ws12
-bindsym $mod+z workspace number $ws13
-bindsym $mod+x workspace number $ws14
-bindsym $mod+c workspace number $ws15
-bindsym $mod+v workspace number $ws16
+bindsym $mod+a workspace $ws9
+bindsym $mod+s workspace $ws10
+bindsym $mod+d workspace $ws11
+bindsym $mod+f workspace $ws12
+bindsym $mod+z workspace $ws13
+bindsym $mod+x workspace $ws14
+bindsym $mod+c workspace $ws15
+bindsym $mod+v workspace $ws16
 
 # move focused container to workspace
-bindsym $mod+Mod1+j move container to workspace number $ws1
-bindsym $mod+Mod1+k move container to workspace number $ws2
-bindsym $mod+Mod1+l move container to workspace number $ws3
-bindsym $mod+Mod1+semicolon move container to workspace number $ws4
-bindsym $mod+Mod1+m move container to workspace number $ws5
-bindsym $mod+Mod1+comma move container to workspace number $ws6
-bindsym $mod+Mod1+period move container to workspace number $ws7
-bindsym $mod+Mod1+slash move container to workspace number $ws8
+bindsym $mod+Mod1+j move container to workspace $ws1
+bindsym $mod+Mod1+k move container to workspace $ws2
+bindsym $mod+Mod1+l move container to workspace $ws3
+bindsym $mod+Mod1+semicolon move container to workspace $ws4
+bindsym $mod+Mod1+m move container to workspace $ws5
+bindsym $mod+Mod1+comma move container to workspace $ws6
+bindsym $mod+Mod1+period move container to workspace $ws7
+bindsym $mod+Mod1+slash move container to workspace $ws8
 
-bindsym $mod+Mod1+a move container to workspace number $ws9
-bindsym $mod+Mod1+s move container to workspace number $ws10
-bindsym $mod+Mod1+d move container to workspace number $ws11
-bindsym $mod+Mod1+f move container to workspace number $ws12
-bindsym $mod+Mod1+z move container to workspace number $ws13
-bindsym $mod+Mod1+x move container to workspace number $ws14
-bindsym $mod+Mod1+c move container to workspace number $ws15
-bindsym $mod+Mod1+v move container to workspace number $ws16
+bindsym $mod+Mod1+a move container to workspace $ws9
+bindsym $mod+Mod1+s move container to workspace $ws10
+bindsym $mod+Mod1+d move container to workspace $ws11
+bindsym $mod+Mod1+f move container to workspace $ws12
+bindsym $mod+Mod1+z move container to workspace $ws13
+bindsym $mod+Mod1+x move container to workspace $ws14
+bindsym $mod+Mod1+c move container to workspace $ws15
+bindsym $mod+Mod1+v move container to workspace $ws16
 
 # Cycle through windows forward
 bindsym $mod+Tab focus right

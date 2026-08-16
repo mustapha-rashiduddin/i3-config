@@ -159,7 +159,10 @@ def box_width(workspaces):
         w = max(w, ws.get("rect", {}).get("width", 0))
     if not w:
         return 120
-    return (w // 8) - 1
+    n = 8
+    sep = 9
+    slack = 8
+    return (w - n * sep - slack) // n
 
 
 def truncate(label, width):
@@ -198,15 +201,6 @@ def render(row_keys):
             "min_width": width,
             "background": bg,
             "color": fg,
-            "border": "LRTB",
-            "border_left": 1,
-            "border_right": 1,
-            "border_top": 1,
-            "border_bottom": 1,
-            "border_left_color": bd,
-            "border_right_color": bd,
-            "border_top_color": bd,
-            "border_bottom_color": bd,
         })
     return blocks
 

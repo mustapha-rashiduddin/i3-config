@@ -17,6 +17,8 @@ ROW_TOP = ["a", "s", "d", "f", "j", "k", "l", ";"]
 ROW_BOTTOM = ["z", "x", "c", "v", "m", ",", ".", "/"]
 ROWS = {"top": ROW_TOP, "bottom": ROW_BOTTOM}
 
+LEFT_HAND = set(ROW_TOP[:4] + ROW_BOTTOM[:4])
+
 CHAR_W = 12
 PAD_W = 11
 ELL = "…"
@@ -189,9 +191,9 @@ def render(row_keys):
             elif ws.get("urgent"):
                 bg, fg, bd = "#7a1010", "#ffffff", "#a00000"
             else:
-                bg, fg, bd = "#2e2e2e", "#ff5252", "#4a4a4a"
+                bg, fg, bd = ("#2e2e2e", "#00ff00" if key in LEFT_HAND else "#ff5252", "#4a4a4a")
         else:
-            bg, fg, bd = "#1c1c1c", "#ff5252", "#333333"
+            bg, fg, bd = ("#1c1c1c", "#00ff00" if key in LEFT_HAND else "#ff5252", "#333333")
         blocks.append({
             "full_text": text,
             "name": f"ws.{key}",

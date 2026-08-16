@@ -4,6 +4,7 @@ bar {
         workspace_buttons no
         binding_mode_indicator no
         status_command /home/saifr/.config/i3/ws.py bottom
+        tray_output none
 
         # Define a color block for the light theme
         colors {
@@ -26,6 +27,7 @@ bar {
         workspace_buttons no
         binding_mode_indicator no
         status_command /home/saifr/.config/i3/ws.py top
+        tray_output none
 
         # Define a color block for the light theme
         colors {

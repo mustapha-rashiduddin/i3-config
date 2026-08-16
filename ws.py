@@ -189,9 +189,9 @@ def render(row_keys):
             elif ws.get("urgent"):
                 bg, fg, bd = "#7a1010", "#ffffff", "#a00000"
             else:
-                bg, fg, bd = "#2e2e2e", "#e0e0e0", "#4a4a4a"
+                bg, fg, bd = "#2e2e2e", "#ff5252", "#4a4a4a"
         else:
-            bg, fg, bd = "#1c1c1c", "#6f6f6f", "#333333"
+            bg, fg, bd = "#1c1c1c", "#ff5252", "#333333"
         blocks.append({
             "full_text": text,
             "name": f"ws.{key}",

@@ -187,7 +187,7 @@ def render(row_keys):
         text = " " + truncate(label, width) + " "
         if ws:
             if ws.get("focused"):
-                bg, fg, bd = "#285577", "#ffffff", "#4c7899"
+                bg, fg, bd = ("#009900", "#ffffff", "#006600") if key in LEFT_HAND else ("#285577", "#ffffff", "#4c7899")
             elif ws.get("urgent"):
                 bg, fg, bd = "#7a1010", "#ffffff", "#a00000"
             else:

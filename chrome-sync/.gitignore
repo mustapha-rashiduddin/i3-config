@@ -1,0 +1,4 @@
+# Ignore everything except generators and this file
+*
+!*.py
+!.gitignore

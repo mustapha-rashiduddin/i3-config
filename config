@@ -135,7 +135,7 @@ mode "resize" {
 
 include ~/.config/i3/bar_config_dark
 
-bindsym $mod+e exec --no-startup-id env PATH="$HOME/bin/chrome-sync:$PATH" dmenu_run
+bindsym $mod+e exec --no-startup-id env PATH="$HOME/.config/i3/chrome-sync:$PATH" dmenu_run
 bindsym $mod+q exec --no-startup-id ~/.config/i3/launch-chrome-default
 bindsym $mod+o exec --no-startup-id st -e mksh
 bindsym $mod+i exec --no-startup-id emacs

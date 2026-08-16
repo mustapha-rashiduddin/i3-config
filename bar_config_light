@@ -1,5 +1,5 @@
 bar {
-        id wsbar_bottom
+        id bar_z
         position bottom
         workspace_buttons no
         binding_mode_indicator no
@@ -21,7 +21,7 @@ bar {
 }
 
 bar {
-        id wsbar_top
+        id bar_a
         position bottom
         workspace_buttons no
         binding_mode_indicator no

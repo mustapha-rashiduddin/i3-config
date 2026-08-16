@@ -1,7 +1,53 @@
 bar {
+        id wsbar_bottom
+        position bottom
+        workspace_buttons no
+        binding_mode_indicator no
+        status_command /home/saifr/.config/i3/ws.py bottom
+
+        # Define a color block for the light theme
+        colors {
+            background #eeeeee      # Light gray background
+            statusline #000000      # Black text info (clock, date, volume)
+            separator  #666666      # Dark gray separator lines
+
+            #                    border  backgr. text
+            focused_workspace    #4c7899 #a0a0a0 #000000
+            active_workspace     #333333 #d0d0d0 #333333
+            inactive_workspace   #333333 #eeeeee #333333
+            urgent_workspace     #2f343a #900000 #ffffff
+            binding_mode         #2f343a #900000 #ffffff
+        }
+}
+
+bar {
+        id wsbar_top
+        position bottom
+        workspace_buttons no
+        binding_mode_indicator no
+        status_command /home/saifr/.config/i3/ws.py top
+
+        # Define a color block for the light theme
+        colors {
+            background #eeeeee      # Light gray background
+            statusline #000000      # Black text info (clock, date, volume)
+            separator  #666666      # Dark gray separator lines
+
+            #                    border  backgr. text
+            focused_workspace    #4c7899 #a0a0a0 #000000
+            active_workspace     #333333 #d0d0d0 #333333
+            inactive_workspace   #333333 #eeeeee #333333
+            urgent_workspace     #2f343a #900000 #ffffff
+            binding_mode         #2f343a #900000 #ffffff
+        }
+}
+
+bar {
+        id statusbar
+        position bottom
         status_command /home/saifr/.config/i3/status.py
-        workspace_command /home/saifr/.config/i3/ws.py
-	tray_output primary
+        workspace_buttons no
+        tray_output primary
 
         # Define a color block for the light theme
         colors {

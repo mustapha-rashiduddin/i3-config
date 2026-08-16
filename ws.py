@@ -3,13 +3,23 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
+from select import select
 
 CHROME_CFG = os.path.expanduser("~/.config/google-chrome")
 MARKER = os.path.expanduser("~/.config/i3/.chrome-launched")
 MARKER_WINDOW = 6.0
 _prof_cache = {}
 _win_profiles = {}
+
+ROW_TOP = ["a", "s", "d", "f", "j", "k", "l", ";"]
+ROW_BOTTOM = ["z", "x", "c", "v", "m", ",", ".", "/"]
+ROWS = {"top": ROW_TOP, "bottom": ROW_BOTTOM}
+
+CHAR_W = 12
+PAD_W = 11
+ELL = "…"
 
 
 def run(cmd, timeout=3):
@@ -143,23 +153,62 @@ def apps_by_ws_name():
     return result
 
 
-def render():
+def box_width(workspaces):
+    w = 0
+    for ws in workspaces:
+        w = max(w, ws.get("rect", {}).get("width", 0))
+    if not w:
+        return 120
+    return (w // 8) - 1
+
+
+def truncate(label, width):
+    max_chars = (width - 2 * PAD_W) // CHAR_W
+    if len(label) <= max_chars:
+        return label
+    return label[:max_chars - 1] + ELL
+
+
+def render(row_keys):
+    workspaces = get_workspaces()
+    ws_by_name = {ws.get("name"): ws for ws in workspaces}
     apps = apps_by_ws_name()
-    out = []
-    for ws in get_workspaces():
-        name = ws.get("name", "")
-        app_list = apps.get(name, [])
-        label = f"{name}:{','.join(app_list)}" if app_list else name
-        out.append({
-            "id": ws.get("id", 0),
-            "num": ws.get("num", -1),
-            "name": label,
-            "visible": ws.get("visible", False),
-            "focused": ws.get("focused", False),
-            "output": ws.get("output", "primary"),
-            "urgent": ws.get("urgent", False),
+    width = box_width(workspaces)
+    blocks = []
+    for key in row_keys:
+        ws = ws_by_name.get(key)
+        app_list = apps.get(key, [])
+        label = f"{key}:{','.join(app_list)}" if app_list else key
+        text = " " + truncate(label, width) + " "
+        if ws:
+            if ws.get("focused"):
+                bg, fg, bd = "#285577", "#ffffff", "#4c7899"
+            elif ws.get("urgent"):
+                bg, fg, bd = "#7a1010", "#ffffff", "#a00000"
+            else:
+                bg, fg, bd = "#2e2e2e", "#e0e0e0", "#4a4a4a"
+        else:
+            bg, fg, bd = "#1c1c1c", "#6f6f6f", "#333333"
+        blocks.append({
+            "full_text": text,
+            "name": f"ws.{key}",
+            "instance": key,
+            "align": "left",
+            "separator": False,
+            "min_width": width,
+            "background": bg,
+            "color": fg,
+            "border": "LRTB",
+            "border_left": 1,
+            "border_right": 1,
+            "border_top": 1,
+            "border_bottom": 1,
+            "border_left_color": bd,
+            "border_right_color": bd,
+            "border_top_color": bd,
+            "border_bottom_color": bd,
         })
-    print(json.dumps(out, ensure_ascii=False), flush=True)
+    return blocks
 
 
 def handle_event(line):
@@ -179,12 +228,32 @@ def handle_event(line):
             _win_profiles[xid] = _profiles().get(d) or d
 
 
+def handle_click(line):
+    try:
+        ev = json.loads(line)
+    except Exception:
+        return
+    name = ev.get("name", "")
+    if not name.startswith("ws.") or ev.get("button") not in (1, 2, 3):
+        return
+    run(["i3-msg", "workspace", name[3:]])
+
+
 def main():
-    from select import select
-    DEBOUNCE = 0.1
-    SAFETY = 2.0
-    last_render = 0.0
-    render()
+    row_keys = ROWS.get(sys.argv[1] if len(sys.argv) > 1 else "top", ROW_TOP)
+    state = {"first": True}
+
+    def emit():
+        line = json.dumps(render(row_keys), ensure_ascii=False)
+        if not state["first"]:
+            line = "," + line
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        state["first"] = False
+
+    print(json.dumps({"version": 1, "click_events": True}), flush=True)
+    print("[", flush=True)
+    emit()
     last_render = time.time()
     while True:
         try:
@@ -199,20 +268,26 @@ def main():
         dirty = False
         try:
             while proc.poll() is None:
-                ready, _, _ = select([proc.stdout], [], [], 0.1)
-                if ready:
+                ready, _, _ = select([proc.stdout, sys.stdin], [], [], 0.1)
+                now = time.time()
+                if sys.stdin in ready:
+                    line = sys.stdin.readline()
+                    if line:
+                        handle_click(line)
+                        dirty = True
+                        last_event = now
+                if proc.stdout in ready:
                     line = proc.stdout.readline()
                     if line:
                         handle_event(line)
                         dirty = True
-                        last_event = time.time()
-                now = time.time()
-                if dirty and now - last_render >= DEBOUNCE:
-                    render()
+                        last_event = now
+                if dirty and now - last_render >= 0.1:
+                    emit()
                     last_render = now
                     dirty = False
-                elif now - last_event >= SAFETY:
-                    render()
+                elif now - last_event >= 2.0:
+                    emit()
                     last_render = now
                     last_event = now
         except Exception:

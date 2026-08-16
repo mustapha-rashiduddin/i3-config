@@ -1,4 +1,5 @@
 bar {
-        status_command i3status
+        status_command /home/saifr/.config/i3/status.py
+        workspace_command /home/saifr/.config/i3/ws.py
 	tray_output primary
 }

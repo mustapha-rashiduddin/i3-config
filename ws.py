@@ -15,11 +15,8 @@ _prof_cache = {}
 _win_profiles = {}
 _name_overlay = {}
 
-ROW_TOP = ["a", "s", "d", "f", "j", "k", "l", ";"]
-ROW_BOTTOM = ["z", "x", "c", "v", "m", ",", ".", "/"]
-ROWS = {"top": ROW_TOP, "bottom": ROW_BOTTOM}
-
-LEFT_HAND = set(ROW_TOP[:4] + ROW_BOTTOM[:4])
+ROW_KEYS = ["j", "k", "l", ";", "m", ",", ".", "/"]
+GREEN = set(ROW_KEYS[:4])
 
 CHAR_W = 12
 PAD_W = 11
@@ -241,13 +238,13 @@ def render(row_keys):
         text = " " + truncate(label, width) + " "
         if ws:
             if ws.get("focused"):
-                bg, fg, bd = ("#009900", "#ffffff", "#006600") if key in LEFT_HAND else ("#990000", "#ffffff", "#660000")
+                bg, fg, bd = ("#009900", "#ffffff", "#006600") if key in GREEN else ("#990000", "#ffffff", "#660000")
             elif ws.get("urgent"):
                 bg, fg, bd = "#7a1010", "#ffffff", "#a00000"
             else:
-                bg, fg, bd = ("#2e2e2e", "#00ff00" if key in LEFT_HAND else "#ff5252", "#4a4a4a")
+                bg, fg, bd = ("#2e2e2e", "#00ff00" if key in GREEN else "#ff5252", "#4a4a4a")
         else:
-            bg, fg, bd = ("#1c1c1c", "#00ff00" if key in LEFT_HAND else "#ff5252", "#333333")
+            bg, fg, bd = ("#1c1c1c", "#00ff00" if key in GREEN else "#ff5252", "#333333")
         blocks.append({
             "full_text": text,
             "name": f"ws.{key}",
@@ -293,13 +290,12 @@ def handle_click(line):
 
 
 def main():
-    row_keys = ROWS.get(sys.argv[1] if len(sys.argv) > 1 else "top", ROW_TOP)
     state = {"first": True}
     load_overlay()
 
     def emit():
         load_overlay()
-        line = json.dumps(render(row_keys), ensure_ascii=False)
+        line = json.dumps(render(ROW_KEYS), ensure_ascii=False)
         if not state["first"]:
             line = "," + line
         sys.stdout.write(line + "\n")

@@ -1,18 +1,9 @@
 bar {
-        id bar_a
+        id wsbar
         position bottom
         workspace_buttons no
         binding_mode_indicator no
-        status_command /home/saifr/.config/i3/ws.py top
-        tray_output none
-}
-
-bar {
-        id bar_z
-        position bottom
-        workspace_buttons no
-        binding_mode_indicator no
-        status_command /home/saifr/.config/i3/ws.py bottom
+        status_command /home/saifr/.config/i3/ws.py
         tray_output none
 }
 

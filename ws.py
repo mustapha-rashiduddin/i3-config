@@ -10,8 +10,10 @@ from select import select
 CHROME_CFG = os.path.expanduser("~/.config/google-chrome")
 MARKER = os.path.expanduser("~/.config/i3/.chrome-launched")
 MARKER_WINDOW = 6.0
+OVERLAY = os.path.expanduser("~/.config/i3/window_names.json")
 _prof_cache = {}
 _win_profiles = {}
+_name_overlay = {}
 
 ROW_TOP = ["a", "s", "d", "f", "j", "k", "l", ";"]
 ROW_BOTTOM = ["z", "x", "c", "v", "m", ",", ".", "/"]
@@ -120,13 +122,65 @@ def window_profile(xid):
     return _profiles().get(directory, "Google-chrome")
 
 
+def load_overlay():
+    global _name_overlay, _overlay_mtime
+    try:
+        mtime = os.path.getmtime(OVERLAY)
+    except Exception:
+        mtime = 0.0
+    if mtime == _overlay_mtime:
+        return
+    _overlay_mtime = mtime
+    try:
+        with open(OVERLAY) as f:
+            _name_overlay = json.load(f)
+    except Exception:
+        _name_overlay = {}
+_overlay_mtime = 0.0
+
+
+def save_overlay():
+    try:
+        with open(OVERLAY, "w") as f:
+            json.dump(_name_overlay, f, indent=2)
+    except Exception:
+        pass
+
+
+def cleanup_overlay():
+    if not _name_overlay:
+        return
+    tree = get_tree()
+    if not tree:
+        return
+    known = set()
+    _collect_all_ids(tree, known)
+    changed = False
+    for con_id in list(_name_overlay.keys()):
+        if con_id not in known:
+            del _name_overlay[con_id]
+            changed = True
+    if changed:
+        save_overlay()
+
+
+def _collect_all_ids(node, out):
+    out.add(str(node.get("id", "")))
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        _collect_all_ids(child, out)
+
+
 def collect_windows(node):
     out = []
-    props = node.get("window_properties") or {}
-    if props.get("class") == "Google-chrome":
-        out.append(chrome_label(node.get("window")))
-    elif props.get("class"):
-        out.append(props["class"])
+    con_id = str(node.get("id", ""))
+    if con_id in _name_overlay:
+        out.append(_name_overlay[con_id])
+    else:
+        props = node.get("window_properties") or {}
+        if props.get("class") == "Google-chrome":
+            out.append(chrome_label(node.get("window")))
+        elif props.get("class"):
+            out.append(props["class"])
     for child in node.get("nodes", []) + node.get("floating_nodes", []):
         out.extend(collect_windows(child))
     return out
@@ -214,13 +268,16 @@ def handle_event(line):
         return
     c = ev.get("container") or {}
     xid = c.get("window")
-    if xid is None:
-        return
+    con_id = str(c.get("id", ""))
     if ev.get("change") == "close":
-        _win_profiles.pop(xid, None)
+        if xid is not None:
+            _win_profiles.pop(xid, None)
+        if con_id in _name_overlay:
+            del _name_overlay[con_id]
+            save_overlay()
     elif ev.get("change") == "new":
         d = marker_directory()
-        if d:
+        if d and xid is not None:
             _win_profiles[xid] = _profiles().get(d) or d
 
 
@@ -238,8 +295,10 @@ def handle_click(line):
 def main():
     row_keys = ROWS.get(sys.argv[1] if len(sys.argv) > 1 else "top", ROW_TOP)
     state = {"first": True}
+    load_overlay()
 
     def emit():
+        load_overlay()
         line = json.dumps(render(row_keys), ensure_ascii=False)
         if not state["first"]:
             line = "," + line
@@ -251,6 +310,7 @@ def main():
     print("[", flush=True)
     emit()
     last_render = time.time()
+    last_cleanup = time.time()
     while True:
         try:
             proc = subprocess.Popen(
@@ -282,6 +342,9 @@ def main():
                     emit()
                     last_render = now
                     dirty = False
+                    if now - last_cleanup >= 30:
+                        cleanup_overlay()
+                        last_cleanup = now
                 elif now - last_event >= 2.0:
                     emit()
                     last_render = now

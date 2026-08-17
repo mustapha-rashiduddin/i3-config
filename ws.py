@@ -368,8 +368,6 @@ def render(row_keys):
                 bg, fg = "#7a1010", "#ffffff"
             else:
                 bg, fg = ("#2e2e2e", "#00ff00" if key in GREEN else "#ff5252")
-        elif _last_focused == key:
-            bg, fg = ("#009900", "#ffffff") if key in GREEN else ("#990000", "#ffffff")
         else:
             bg, fg = ("#1c1c1c", "#00ff00" if key in GREEN else "#ff5252")
         blocks.append({
@@ -456,6 +454,7 @@ def main():
 
     def emit():
         nonlocal first
+        load_overlay()
         line = json.dumps(render(ROW_KEYS), ensure_ascii=False)
         if not first:
             line = "," + line
@@ -498,21 +497,13 @@ def main():
                 fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
             while proc.poll() is None:
                 ready, _, _ = select(fds, [], [], 0.5)
-                if proc.stdout in ready:
-                    try:
-                        sub_buf += os.read(proc.stdout.fileno(), 4096).decode(errors="replace")
-                    except (OSError, ValueError):
-                        pass
-                    while "\n" in sub_buf:
-                        line, sub_buf = sub_buf.split("\n", 1)
-                        if line:
-                            handle_event(line)
-                            emit()
-                if refresh_fd in ready:
-                    try:
-                        os.read(_refresh_pipe_r, 4096)
-                    except OSError:
-                        pass
+                try:
+                    cur_mtime = os.path.getmtime(OVERLAY)
+                except Exception:
+                    cur_mtime = None
+                if cur_mtime is not None and cur_mtime != _overlay_mtime:
+                    load_overlay()
+                    _rebuild_apps()
                     emit()
                 if inotify_fd is not None and inotify_fd in ready:
                     try:
@@ -521,6 +512,12 @@ def main():
                         pass
                     load_overlay()
                     _rebuild_apps()
+                    emit()
+                if refresh_fd in ready:
+                    try:
+                        os.read(_refresh_pipe_r, 4096)
+                    except OSError:
+                        pass
                     emit()
                 if sys.stdin in ready:
                     try:
@@ -531,6 +528,16 @@ def main():
                         line, in_buf = in_buf.split("\n", 1)
                         if line:
                             handle_click(line)
+                            emit()
+                if proc.stdout in ready:
+                    try:
+                        sub_buf += os.read(proc.stdout.fileno(), 4096).decode(errors="replace")
+                    except (OSError, ValueError):
+                        pass
+                    while "\n" in sub_buf:
+                        line, sub_buf = sub_buf.split("\n", 1)
+                        if line:
+                            handle_event(line)
                             emit()
         except Exception:
             time.sleep(1)

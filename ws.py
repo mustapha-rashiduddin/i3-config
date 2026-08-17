@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ctypes
 import fcntl
 import json
 import os
@@ -39,6 +40,7 @@ _refresh_event = threading.Event()
 _refresh_pipe_r, _refresh_pipe_w = os.pipe()
 _last_focused = None
 _focus_gen = 0
+_cached_tree = None
 
 
 def run(cmd, timeout=3):
@@ -254,11 +256,29 @@ def truncate(label, width):
     return label[:max_chars - 1] + ELL
 
 
-def _refresh():
+def _rebuild_apps():
     global _snapshot
+    if _cached_tree is None:
+        return
+    apps = {}
+    for node in walk_workspaces(_cached_tree):
+        name = node.get("name", "")
+        if name == "__i3_scratch":
+            continue
+        apps_list = []
+        for a in collect_windows(node):
+            if a not in apps_list:
+                apps_list.append(a)
+        apps[name] = apps_list
+    _snapshot = {**_snapshot, "apps": apps}
+
+
+def _refresh():
+    global _snapshot, _cached_tree
     gen = _focus_gen
     workspaces = get_workspaces()
     tree = get_tree()
+    _cached_tree = tree
     apps = {}
     for node in walk_workspaces(tree):
         name = node.get("name", "")
@@ -447,11 +467,40 @@ def main():
         in_buf = ""
         refresh_fd = os.fdopen(_refresh_pipe_r, "rb", buffering=0, closefd=False)
         try:
+            inotify_fd = None
+            try:
+                _libc = ctypes.CDLL("libc.so.6")
+                _inotify_fd = _libc.inotify_init()
+                _overlay_bytes = os.path.abspath(OVERLAY).encode()
+                _libc.inotify_add_watch(_inotify_fd, _overlay_bytes,
+                                        0x00000008 | 0x00000080)
+                inotify_fd = _inotify_fd
+            except Exception:
+                pass
+            fds = [proc.stdout, sys.stdin, refresh_fd]
+            if inotify_fd is not None:
+                fds.append(inotify_fd)
             for fd in (proc.stdout.fileno(), sys.stdin.fileno(), _refresh_pipe_r):
                 fl = fcntl.fcntl(fd, fcntl.F_GETFL)
                 fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
             while proc.poll() is None:
-                ready, _, _ = select([proc.stdout, sys.stdin, refresh_fd], [], [], 0.5)
+                ready, _, _ = select(fds, [], [], 0.5)
+                try:
+                    cur_mtime = os.path.getmtime(OVERLAY)
+                except Exception:
+                    cur_mtime = None
+                if cur_mtime is not None and cur_mtime != _overlay_mtime:
+                    load_overlay()
+                    _rebuild_apps()
+                    emit()
+                if inotify_fd is not None and inotify_fd in ready:
+                    try:
+                        os.read(inotify_fd, 4096)
+                    except OSError:
+                        pass
+                    load_overlay()
+                    _rebuild_apps()
+                    emit()
                 if refresh_fd in ready:
                     try:
                         os.read(_refresh_pipe_r, 4096)

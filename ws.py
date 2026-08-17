@@ -433,6 +433,18 @@ def handle_event(line):
         global _cached_tree
         try:
             _cached_tree = get_tree()
+            c = ev.get("container") or {}
+            moved_id = str(c.get("id", ""))
+            if moved_id and _cached_tree:
+                for node in walk_workspaces(_cached_tree):
+                    name = node.get("name", "")
+                    if name == "__i3_scratch":
+                        continue
+                    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+                        if str(child.get("id", "")) == moved_id:
+                            if not any(ws.get("name") == name for ws in _snapshot["workspaces"]):
+                                _snapshot["workspaces"].append({"name": name})
+                            break
             _rebuild_apps()
         except Exception:
             pass

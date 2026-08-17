@@ -37,6 +37,8 @@ _snapshot = {
 }
 _refresh_event = threading.Event()
 _refresh_pipe_r, _refresh_pipe_w = os.pipe()
+_last_focused = None
+_focus_gen = 0
 
 
 def run(cmd, timeout=3):
@@ -254,6 +256,7 @@ def truncate(label, width):
 
 def _refresh():
     global _snapshot
+    gen = _focus_gen
     workspaces = get_workspaces()
     tree = get_tree()
     apps = {}
@@ -271,6 +274,12 @@ def _refresh():
     tray_w = 6 * (2 * PAD_W + 3 * CHAR_W)
     sw = text_w + tray_w
     screen_w = max((ws.get("rect", {}).get("width", 0) for ws in workspaces), default=0)
+    pf = _last_focused
+    if pf:
+        for ws in workspaces:
+            ws["focused"] = ws.get("name") == pf
+    if _focus_gen != gen:
+        return
     _snapshot = {
         "workspaces": workspaces,
         "apps": apps,
@@ -361,8 +370,11 @@ def handle_event(line):
         return
     change = ev.get("change")
     if change == "focus" and ev.get("current", {}).get("type") == "workspace":
+        global _focus_gen
         new_name = ev["current"].get("name", "")
         if new_name:
+            _last_focused = new_name
+            _focus_gen += 1
             for ws in _snapshot["workspaces"]:
                 ws["focused"] = ws.get("name") == new_name
         _refresh_event.set()

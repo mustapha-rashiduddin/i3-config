@@ -421,6 +421,12 @@ def handle_event(line):
             _win_profiles[xid] = _profiles().get(d) or d
         _refresh_event.set()
     elif change == "move":
+        global _cached_tree
+        try:
+            _cached_tree = get_tree()
+            _rebuild_apps()
+        except Exception:
+            pass
         _refresh_event.set()
     elif change == "title":
         _refresh_event.set()

@@ -35,6 +35,7 @@ _snapshot = {
     "status": ["...", "...", "...", "...", "...", "..."],
     "screen_w": 0,
 }
+_refresh_event = threading.Event()
 
 
 def run(cmd, timeout=3):
@@ -281,6 +282,8 @@ def _refresh():
 def _bg_refresh():
     last_cleanup = 0.0
     while True:
+        _refresh_event.wait(timeout=1.0)
+        _refresh_event.clear()
         try:
             _refresh()
         except Exception:
@@ -306,7 +309,6 @@ def _bg_refresh():
             except Exception:
                 pass
             last_cleanup = now
-        time.sleep(1)
 
 
 def render(row_keys):
@@ -362,6 +364,7 @@ def handle_event(line):
         if new_name:
             for ws in _snapshot["workspaces"]:
                 ws["focused"] = ws.get("name") == new_name
+        _refresh_event.set()
         return
     c = ev.get("container") or {}
     xid = c.get("window")
@@ -372,10 +375,16 @@ def handle_event(line):
         if con_id in _name_overlay:
             del _name_overlay[con_id]
             save_overlay()
+        _refresh_event.set()
     elif change == "new":
         d = marker_directory()
         if d and xid is not None:
             _win_profiles[xid] = _profiles().get(d) or d
+        _refresh_event.set()
+    elif change == "move":
+        _refresh_event.set()
+    elif change == "title":
+        _refresh_event.set()
 
 
 def handle_click(line):

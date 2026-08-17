@@ -88,7 +88,7 @@ def main():
     overlay = load_overlay()
     overlay[con_id] = new_name
     save_overlay(overlay)
-    subprocess.run(["i3-msg", "nop"])
+    subprocess.run(["i3-msg", "workspace", "current"])
 
 
 if __name__ == "__main__":

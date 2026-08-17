@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from select import select
 
 CHROME_CFG = os.path.expanduser("~/.config/google-chrome")
@@ -206,16 +208,24 @@ def apps_by_ws_name():
     return result
 
 
+def status_width():
+    texts = [disk_block(), mem_block(), load_block(), vol_block(), bat_block(), time_block()]
+    text_w = sum(2 * PAD_W + len(t) * CHAR_W for t in texts)
+    tray_w = 6 * (2 * PAD_W + 3 * CHAR_W)
+    return text_w + tray_w
+
+
 def box_width(workspaces):
     w = 0
     for ws in workspaces:
         w = max(w, ws.get("rect", {}).get("width", 0))
     if not w:
         return 120
-    n = 8
-    sep = 9
-    slack = 8
-    return (w - n * sep - slack) // n
+    n = len(ROW_KEYS)
+    sw = status_width()
+    avail = max(w - sw, 0)
+    #return (avail // n) * 1
+    return 131
 
 
 def truncate(label, width):
@@ -225,10 +235,66 @@ def truncate(label, width):
     return label[:max_chars - 1] + ELL
 
 
+def vol_block():
+    v = run(["pamixer", "--get-volume"])
+    muted = run(["pamixer", "--get-mute"]) == "true"
+    if not v:
+        return "?: ?"
+    return f"?: muted ({v}%)" if muted else f"?: {v}%"
+
+
+def bat_block():
+    try:
+        with open("/sys/class/power_supply/BAT0/capacity") as f:
+            cap = f.read().strip()
+        with open("/sys/class/power_supply/BAT0/status") as f:
+            st = f.read().strip()
+    except Exception:
+        return "BAT: ?"
+    if st == "Charging":
+        icon = "CHR"
+    elif st == "Full":
+        icon = "FULL"
+    else:
+        icon = "BAT"
+    return f"{icon} {cap}%"
+
+
+def mem_block():
+    out = run(["free", "-h"])
+    for line in out.splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 7 and f[0].startswith("Mem"):
+            return f"{f[2]} | {f[6]}"
+    return "MEM: ?"
+
+
+def disk_block():
+    out = run(["df", "-P", "-h", "/"])
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 6 and f[0] != "Filesystem":
+            return f[3]
+    return "DISK: ?"
+
+
+def load_block():
+    try:
+        with open("/proc/loadavg") as f:
+            return f.read().split()[0]
+    except Exception:
+        return "?"
+
+
+def time_block():
+    return datetime.now().strftime("{ %A } %d/%m/%Y %H:%M:%S")
+
+
 def render(row_keys):
     workspaces = get_workspaces()
     ws_by_name = {ws.get("name"): ws for ws in workspaces}
     apps = apps_by_ws_name()
+    w = max((ws.get("rect", {}).get("width", 0) for ws in workspaces), default=0)
     width = box_width(workspaces)
     blocks = []
     for key in row_keys:
@@ -255,6 +321,13 @@ def render(row_keys):
             "background": bg,
             "color": fg,
         })
+    n = len(row_keys)
+    boxes_width = n * width
+    sw = status_width()
+    spacer_width = max(w - boxes_width - sw, 0) if w else 0
+    blocks.append({"full_text": "", "separator": False, "align": "left", "min_width": spacer_width})
+    for text in [disk_block(), mem_block(), load_block(), vol_block(), bat_block(), time_block()]:
+        blocks.append({"full_text": text})
     return blocks
 
 

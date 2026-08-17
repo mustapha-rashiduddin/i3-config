@@ -41,6 +41,7 @@ _refresh_pipe_r, _refresh_pipe_w = os.pipe()
 _last_focused = None
 _focus_gen = 0
 _cached_tree = None
+_overlay_gen = 0
 
 
 def run(cmd, timeout=3):
@@ -257,7 +258,7 @@ def truncate(label, width):
 
 
 def _rebuild_apps():
-    global _snapshot
+    global _snapshot, _overlay_gen
     if _cached_tree is None:
         return
     apps = {}
@@ -271,14 +272,19 @@ def _rebuild_apps():
                 apps_list.append(a)
         apps[name] = apps_list
     _snapshot = {**_snapshot, "apps": apps}
+    _overlay_gen += 1
 
 
 def _refresh():
     global _snapshot, _cached_tree
     gen = _focus_gen
+    ogen = _overlay_gen
     workspaces = get_workspaces()
     tree = get_tree()
     _cached_tree = tree
+    load_overlay()
+    if _overlay_gen != ogen:
+        return
     apps = {}
     for node in walk_workspaces(tree):
         name = node.get("name", "")

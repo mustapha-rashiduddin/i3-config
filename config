@@ -53,14 +53,14 @@ set $ws5 "m"
 set $ws6 ","
 set $ws7 "."
 set $ws8 "/"
-set $ws9 "a"
-set $ws10 "s"
-set $ws11 "d"
-set $ws12 "f"
-set $ws13 "z"
-set $ws14 "x"
-set $ws15 "c"
-set $ws16 "v"
+#set $ws9 "a"
+#set $ws10 "s"
+#set $ws11 "d"
+#set $ws12 "f"
+#set $ws13 "z"
+#set $ws14 "x"
+#set $ws15 "c"
+#set $ws16 "v"
 
 # switch to workspace
 bindsym $mod+j workspace $ws1
@@ -72,14 +72,14 @@ bindsym $mod+comma workspace $ws6
 bindsym $mod+period workspace $ws7
 bindsym $mod+slash workspace $ws8
 
-bindsym $mod+a workspace $ws9
-bindsym $mod+s workspace $ws10
-bindsym $mod+d workspace $ws11
-bindsym $mod+f workspace $ws12
-bindsym $mod+z workspace $ws13
-bindsym $mod+x workspace $ws14
-bindsym $mod+c workspace $ws15
-bindsym $mod+v workspace $ws16
+#bindsym $mod+a workspace $ws9
+#bindsym $mod+s workspace $ws10
+#bindsym $mod+d workspace $ws11
+#bindsym $mod+f workspace $ws12
+#bindsym $mod+z workspace $ws13
+#bindsym $mod+x workspace $ws14
+#bindsym $mod+c workspace $ws15
+#bindsym $mod+v workspace $ws16
 
 # move focused container to workspace
 bindsym $mod+Mod1+j move container to workspace $ws1
@@ -91,14 +91,14 @@ bindsym $mod+Mod1+comma move container to workspace $ws6
 bindsym $mod+Mod1+period move container to workspace $ws7
 bindsym $mod+Mod1+slash move container to workspace $ws8
 
-bindsym $mod+Mod1+a move container to workspace $ws9
-bindsym $mod+Mod1+s move container to workspace $ws10
-bindsym $mod+Mod1+d move container to workspace $ws11
-bindsym $mod+Mod1+f move container to workspace $ws12
-bindsym $mod+Mod1+z move container to workspace $ws13
-bindsym $mod+Mod1+x move container to workspace $ws14
-bindsym $mod+Mod1+c move container to workspace $ws15
-bindsym $mod+Mod1+v move container to workspace $ws16
+#bindsym $mod+Mod1+a move container to workspace $ws9
+#bindsym $mod+Mod1+s move container to workspace $ws10
+#bindsym $mod+Mod1+d move container to workspace $ws11
+#bindsym $mod+Mod1+f move container to workspace $ws12
+#bindsym $mod+Mod1+z move container to workspace $ws13
+#bindsym $mod+Mod1+x move container to workspace $ws14
+#bindsym $mod+Mod1+c move container to workspace $ws15
+#bindsym $mod+Mod1+v move container to workspace $ws16
 
 # Rename window
 bindsym $mod+n exec --no-startup-id /etc/profiles/per-user/saifr/bin/python3 ~/.config/i3/rename-window.py

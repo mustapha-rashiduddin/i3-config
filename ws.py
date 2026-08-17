@@ -36,6 +36,7 @@ _snapshot = {
     "screen_w": 0,
 }
 _refresh_event = threading.Event()
+_refresh_pipe_r, _refresh_pipe_w = os.pipe()
 
 
 def run(cmd, timeout=3):
@@ -289,7 +290,7 @@ def _bg_refresh():
         except Exception:
             pass
         try:
-            subprocess.run(["i3-msg", "nop"], timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.write(_refresh_pipe_w, b"\n")
         except Exception:
             pass
         now = time.time()
@@ -432,12 +433,19 @@ def main():
             continue
         sub_buf = ""
         in_buf = ""
+        refresh_fd = os.fdopen(_refresh_pipe_r, "rb", buffering=0, closefd=False)
         try:
-            for fd in (proc.stdout.fileno(), sys.stdin.fileno()):
+            for fd in (proc.stdout.fileno(), sys.stdin.fileno(), _refresh_pipe_r):
                 fl = fcntl.fcntl(fd, fcntl.F_GETFL)
                 fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
             while proc.poll() is None:
-                ready, _, _ = select([proc.stdout, sys.stdin], [], [], 0.5)
+                ready, _, _ = select([proc.stdout, sys.stdin, refresh_fd], [], [], 0.5)
+                if refresh_fd in ready:
+                    try:
+                        os.read(_refresh_pipe_r, 4096)
+                    except OSError:
+                        pass
+                    emit()
                 if sys.stdin in ready:
                     try:
                         in_buf += os.read(sys.stdin.fileno(), 4096).decode(errors="replace")

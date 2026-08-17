@@ -101,7 +101,7 @@ bindsym $mod+Mod1+c move container to workspace $ws15
 bindsym $mod+Mod1+v move container to workspace $ws16
 
 # Rename window
-bindsym $mod+n exec /etc/profiles/per-user/saifr/bin/python3 ~/.config/i3/rename-window.py
+bindsym $mod+n exec --no-startup-id /etc/profiles/per-user/saifr/bin/python3 ~/.config/i3/rename-window.py
 
 # Cycle through windows forward
 bindsym $mod+Tab focus right

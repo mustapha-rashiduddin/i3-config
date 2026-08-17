@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from select import select
@@ -16,13 +17,24 @@ OVERLAY = os.path.expanduser("~/.config/i3/window_names.json")
 _prof_cache = {}
 _win_profiles = {}
 _name_overlay = {}
+_overlay_mtime = 0.0
 
 ROW_KEYS = ["j", "k", "l", ";", "m", ",", ".", "/"]
 GREEN = set(ROW_KEYS[:4])
 
 CHAR_W = 12
 PAD_W = 11
-ELL = "…"
+ELL = "\u2026"
+
+BOX_WIDTH = 131
+
+_snapshot = {
+    "workspaces": [],
+    "apps": {},
+    "sw": 0,
+    "status": ["...", "...", "...", "...", "...", "..."],
+    "screen_w": 0,
+}
 
 
 def run(cmd, timeout=3):
@@ -135,7 +147,6 @@ def load_overlay():
             _name_overlay = json.load(f)
     except Exception:
         _name_overlay = {}
-_overlay_mtime = 0.0
 
 
 def save_overlay():
@@ -144,23 +155,6 @@ def save_overlay():
             json.dump(_name_overlay, f, indent=2)
     except Exception:
         pass
-
-
-def cleanup_overlay():
-    if not _name_overlay:
-        return
-    tree = get_tree()
-    if not tree:
-        return
-    known = set()
-    _collect_all_ids(tree, known)
-    changed = False
-    for con_id in list(_name_overlay.keys()):
-        if con_id not in known:
-            del _name_overlay[con_id]
-            changed = True
-    if changed:
-        save_overlay()
 
 
 def _collect_all_ids(node, out):
@@ -192,47 +186,6 @@ def walk_workspaces(node):
     for child in node.get("nodes", []) + node.get("floating_nodes", []):
         found.extend(walk_workspaces(child))
     return found
-
-
-def apps_by_ws_name():
-    result = {}
-    for node in walk_workspaces(get_tree()):
-        name = node.get("name", "")
-        if name == "__i3_scratch":
-            continue
-        apps = []
-        for a in collect_windows(node):
-            if a not in apps:
-                apps.append(a)
-        result[name] = apps
-    return result
-
-
-def status_width():
-    texts = [disk_block(), mem_block(), load_block(), vol_block(), bat_block(), time_block()]
-    text_w = sum(2 * PAD_W + len(t) * CHAR_W for t in texts)
-    tray_w = 6 * (2 * PAD_W + 3 * CHAR_W)
-    return text_w + tray_w
-
-
-def box_width(workspaces):
-    w = 0
-    for ws in workspaces:
-        w = max(w, ws.get("rect", {}).get("width", 0))
-    if not w:
-        return 120
-    n = len(ROW_KEYS)
-    sw = status_width()
-    avail = max(w - sw, 0)
-    #return (avail // n) * 1
-    return 131
-
-
-def truncate(label, width):
-    max_chars = (width - 2 * PAD_W) // CHAR_W
-    if len(label) <= max_chars:
-        return label
-    return label[:max_chars - 1] + ELL
 
 
 def vol_block():
@@ -290,12 +243,80 @@ def time_block():
     return datetime.now().strftime("{ %A } %d/%m/%Y %H:%M:%S")
 
 
-def render(row_keys):
+def truncate(label, width):
+    max_chars = (width - 2 * PAD_W) // CHAR_W
+    if len(label) <= max_chars:
+        return label
+    return label[:max_chars - 1] + ELL
+
+
+def _refresh():
+    global _snapshot
     workspaces = get_workspaces()
+    tree = get_tree()
+    apps = {}
+    for node in walk_workspaces(tree):
+        name = node.get("name", "")
+        if name == "__i3_scratch":
+            continue
+        apps_list = []
+        for a in collect_windows(node):
+            if a not in apps_list:
+                apps_list.append(a)
+        apps[name] = apps_list
+    status_texts = [disk_block(), mem_block(), load_block(), vol_block(), bat_block(), time_block()]
+    text_w = sum(2 * PAD_W + len(t) * CHAR_W for t in status_texts)
+    tray_w = 6 * (2 * PAD_W + 3 * CHAR_W)
+    sw = text_w + tray_w
+    screen_w = max((ws.get("rect", {}).get("width", 0) for ws in workspaces), default=0)
+    _snapshot = {
+        "workspaces": workspaces,
+        "apps": apps,
+        "sw": sw,
+        "status": status_texts,
+        "screen_w": screen_w,
+    }
+
+
+def _bg_refresh():
+    last_cleanup = 0.0
+    while True:
+        try:
+            _refresh()
+        except Exception:
+            pass
+        try:
+            subprocess.run(["i3-msg", "nop"], timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        now = time.time()
+        if now - last_cleanup >= 30 and _name_overlay:
+            try:
+                tree = get_tree()
+                if tree:
+                    known = set()
+                    _collect_all_ids(tree, known)
+                    changed = False
+                    for con_id in list(_name_overlay.keys()):
+                        if con_id not in known:
+                            del _name_overlay[con_id]
+                            changed = True
+                    if changed:
+                        save_overlay()
+            except Exception:
+                pass
+            last_cleanup = now
+        time.sleep(1)
+
+
+def render(row_keys):
+    snap = _snapshot
+    workspaces = snap["workspaces"]
     ws_by_name = {ws.get("name"): ws for ws in workspaces}
-    apps = apps_by_ws_name()
-    w = max((ws.get("rect", {}).get("width", 0) for ws in workspaces), default=0)
-    width = box_width(workspaces)
+    apps = snap["apps"]
+    sw = snap["sw"]
+    screen_w = snap["screen_w"]
+    width = BOX_WIDTH
     blocks = []
     for key in row_keys:
         ws = ws_by_name.get(key)
@@ -304,13 +325,13 @@ def render(row_keys):
         text = " " + truncate(label, width) + " "
         if ws:
             if ws.get("focused"):
-                bg, fg, bd = ("#009900", "#ffffff", "#006600") if key in GREEN else ("#990000", "#ffffff", "#660000")
+                bg, fg = ("#009900", "#ffffff") if key in GREEN else ("#990000", "#ffffff")
             elif ws.get("urgent"):
-                bg, fg, bd = "#7a1010", "#ffffff", "#a00000"
+                bg, fg = "#7a1010", "#ffffff"
             else:
-                bg, fg, bd = ("#2e2e2e", "#00ff00" if key in GREEN else "#ff5252", "#4a4a4a")
+                bg, fg = ("#2e2e2e", "#00ff00" if key in GREEN else "#ff5252")
         else:
-            bg, fg, bd = ("#1c1c1c", "#00ff00" if key in GREEN else "#ff5252", "#333333")
+            bg, fg = ("#1c1c1c", "#00ff00" if key in GREEN else "#ff5252")
         blocks.append({
             "full_text": text,
             "name": f"ws.{key}",
@@ -323,10 +344,9 @@ def render(row_keys):
         })
     n = len(row_keys)
     boxes_width = n * width
-    sw = status_width()
-    spacer_width = max(w - boxes_width - sw, 0) if w else 0
+    spacer_width = max(screen_w - boxes_width - sw, 0) if screen_w else 0
     blocks.append({"full_text": "", "separator": False, "align": "left", "min_width": spacer_width})
-    for text in [disk_block(), mem_block(), load_block(), vol_block(), bat_block(), time_block()]:
+    for text in snap["status"]:
         blocks.append({"full_text": text})
     return blocks
 
@@ -336,16 +356,23 @@ def handle_event(line):
         ev = json.loads(line)
     except Exception:
         return
+    change = ev.get("change")
+    if change == "focus" and ev.get("current", {}).get("type") == "workspace":
+        new_name = ev["current"].get("name", "")
+        if new_name:
+            for ws in _snapshot["workspaces"]:
+                ws["focused"] = ws.get("name") == new_name
+        return
     c = ev.get("container") or {}
     xid = c.get("window")
     con_id = str(c.get("id", ""))
-    if ev.get("change") == "close":
+    if change == "close":
         if xid is not None:
             _win_profiles.pop(xid, None)
         if con_id in _name_overlay:
             del _name_overlay[con_id]
             save_overlay()
-    elif ev.get("change") == "new":
+    elif change == "new":
         d = marker_directory()
         if d and xid is not None:
             _win_profiles[xid] = _profiles().get(d) or d
@@ -363,61 +390,65 @@ def handle_click(line):
 
 
 def main():
-    state = {"first": True}
     load_overlay()
+    _refresh()
+
+    t = threading.Thread(target=_bg_refresh, daemon=True)
+    t.start()
+
+    first = True
 
     def emit():
+        nonlocal first
         load_overlay()
         line = json.dumps(render(ROW_KEYS), ensure_ascii=False)
-        if not state["first"]:
+        if not first:
             line = "," + line
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
-        state["first"] = False
+        first = False
 
     print(json.dumps({"version": 1, "click_events": True}), flush=True)
     print("[", flush=True)
     emit()
-    last_render = time.time()
-    last_cleanup = time.time()
+
     while True:
         try:
             proc = subprocess.Popen(
                 ["i3-msg", "-t", "subscribe", "-m",
-                 '["workspace","output","window"]'],
+                 '["workspace","output","window","tick"]'],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except Exception:
             time.sleep(1)
             continue
-        last_event = time.time()
-        dirty = False
+        sub_buf = ""
+        in_buf = ""
         try:
+            for fd in (proc.stdout.fileno(), sys.stdin.fileno()):
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
             while proc.poll() is None:
-                ready, _, _ = select([proc.stdout, sys.stdin], [], [], 0.1)
-                now = time.time()
+                ready, _, _ = select([proc.stdout, sys.stdin], [], [], 0.5)
                 if sys.stdin in ready:
-                    line = sys.stdin.readline()
-                    if line:
-                        handle_click(line)
-                        dirty = True
-                        last_event = now
+                    try:
+                        in_buf += os.read(sys.stdin.fileno(), 4096).decode(errors="replace")
+                    except (OSError, ValueError):
+                        pass
+                    while "\n" in in_buf:
+                        line, in_buf = in_buf.split("\n", 1)
+                        if line:
+                            handle_click(line)
+                            emit()
                 if proc.stdout in ready:
-                    line = proc.stdout.readline()
-                    if line:
-                        handle_event(line)
-                        dirty = True
-                        last_event = now
-                if dirty and now - last_render >= 0.1:
-                    emit()
-                    last_render = now
-                    dirty = False
-                    if now - last_cleanup >= 30:
-                        cleanup_overlay()
-                        last_cleanup = now
-                elif now - last_event >= 2.0:
-                    emit()
-                    last_render = now
-                    last_event = now
+                    try:
+                        sub_buf += os.read(proc.stdout.fileno(), 4096).decode(errors="replace")
+                    except (OSError, ValueError):
+                        pass
+                    while "\n" in sub_buf:
+                        line, sub_buf = sub_buf.split("\n", 1)
+                        if line:
+                            handle_event(line)
+                            emit()
         except Exception:
             time.sleep(1)
         proc.wait()

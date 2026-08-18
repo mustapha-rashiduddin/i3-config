@@ -23,18 +23,6 @@ def save_overlay(data):
         pass
 
 
-def get_focused_con_id():
-    try:
-        tree = json.loads(subprocess.check_output(
-            ["i3-msg", "-t", "get_tree"], text=True, timeout=3))
-    except Exception:
-        return None
-    node = find_focused(tree)
-    if node and node.get("window"):
-        return str(node["id"])
-    return None
-
-
 def find_focused(node):
     if node.get("focused"):
         return node
@@ -45,28 +33,22 @@ def find_focused(node):
     return None
 
 
-def get_current_name(con_id):
-    overlay = load_overlay()
-    if con_id in overlay:
-        return overlay[con_id]
+def main():
     try:
         tree = json.loads(subprocess.check_output(
             ["i3-msg", "-t", "get_tree"], text=True, timeout=3))
     except Exception:
-        return ""
-    node = find_focused(tree)
-    if not node:
-        return ""
-    props = node.get("window_properties") or {}
-    return props.get("class", "")
-
-
-def main():
-    con_id = get_focused_con_id()
-    if not con_id:
         sys.exit(1)
+    node = find_focused(tree)
+    if not node or not node.get("window"):
+        sys.exit(1)
+    con_id = str(node["id"])
 
-    current = get_current_name(con_id)
+    overlay = load_overlay()
+    current = overlay.get(con_id)
+    if not current:
+        props = node.get("window_properties") or {}
+        current = props.get("class", "")
 
     try:
         cmd = ["dmenu", "-p", "Rename window:",

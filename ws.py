@@ -333,11 +333,11 @@ def _bg_refresh():
             try:
                 tree = get_tree()
                 if tree:
-                    known = set()
-                    _collect_all_ids(tree, known)
-                    changed = False
-                    for con_id in list(_name_overlay.keys()):
-                        if con_id not in known:
+                known = set()
+                _collect_all_ids(tree, known)
+                changed = False
+                for con_id in list(_name_overlay.keys()):
+                    if con_id not in known:
                             del _name_overlay[con_id]
                             changed = True
                     if changed:

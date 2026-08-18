@@ -573,6 +573,19 @@ def main():
                         data = rename_file.read(4096).decode(errors="replace")
                     except (OSError, ValueError):
                         data = ""
+                    try:
+                        rename_file.close()
+                    except Exception:
+                        pass
+                    try:
+                        old = rename_file
+                        rename_file = os.fdopen(os.open(RENAME_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb", buffering=0)
+                        fds.remove(old)
+                        fds.append(rename_file)
+                    except Exception:
+                        if rename_file in fds:
+                            fds.remove(rename_file)
+                        rename_file = None
                     for line in data.split("\n"):
                         line = line.strip()
                         if not line:

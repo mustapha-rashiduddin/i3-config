@@ -27,7 +27,7 @@ CHAR_W = 12
 PAD_W = 11
 ELL = "\u2026"
 
-BOX_WIDTH = 128
+BOX_WIDTH = 127
 
 _snapshot = {
     "workspaces": [],

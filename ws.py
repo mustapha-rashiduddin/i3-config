@@ -174,6 +174,21 @@ def _collect_all_ids(node, out):
         _collect_all_ids(child, out)
 
 
+def _remove_container(node, con_id, xid):
+    xid_str = str(xid) if xid is not None else ""
+    for key in ("nodes", "floating_nodes"):
+        children = node.get(key, [])
+        for i, child in enumerate(children):
+            child_id = str(child.get("id", ""))
+            child_xid = str(child.get("window", ""))
+            if (con_id and child_id == con_id) or (xid_str and child_xid == xid_str):
+                del children[i]
+                return True
+            if _remove_container(child, con_id, xid):
+                return True
+    return False
+
+
 def collect_windows(node):
     out = []
     con_id = str(node.get("id", ""))
@@ -289,7 +304,6 @@ def _refresh():
     ogen = _overlay_gen
     workspaces = get_workspaces()
     tree = get_tree()
-    _cached_tree = tree
     load_overlay()
     if _overlay_gen != ogen:
         return
@@ -312,8 +326,9 @@ def _refresh():
     if pf:
         for ws in workspaces:
             ws["focused"] = ws.get("name") == pf
-    if _focus_gen != gen:
+    if _focus_gen != gen or _overlay_gen != ogen:
         return
+    _cached_tree = tree
     _snapshot = {
         "workspaces": workspaces,
         "apps": apps,
@@ -400,13 +415,13 @@ def render(row_keys):
 
 
 def handle_event(line):
+    global _cached_tree, _focus_gen, _overlay_gen
     try:
         ev = json.loads(line)
     except Exception:
         return
     change = ev.get("change")
     if change == "focus" and ev.get("current", {}).get("type") == "workspace":
-        global _focus_gen
         new_name = ev["current"].get("name", "")
         if new_name:
             _last_focused = new_name
@@ -426,16 +441,23 @@ def handle_event(line):
     xid = c.get("window")
     con_id = str(c.get("id", ""))
     if change == "close":
+        _overlay_gen += 1
         if xid is not None:
             _win_profiles.pop(xid, None)
+        overlay_changed = False
         if con_id in _name_overlay:
             del _name_overlay[con_id]
-            save_overlay()
+            overlay_changed = True
         if xid is not None:
             xid_str = str(xid)
             if xid_str in _name_overlay:
                 del _name_overlay[xid_str]
-                save_overlay()
+                overlay_changed = True
+        if overlay_changed:
+            save_overlay()
+        if _cached_tree is not None:
+            _remove_container(_cached_tree, con_id, xid)
+            _rebuild_apps()
         _refresh_event.set()
     elif change == "new":
         d = marker_directory()
@@ -443,7 +465,6 @@ def handle_event(line):
             _win_profiles[xid] = _profiles().get(d) or d
         _refresh_event.set()
     elif change == "move":
-        global _cached_tree
         try:
             _cached_tree = get_tree()
             c = ev.get("container") or {}

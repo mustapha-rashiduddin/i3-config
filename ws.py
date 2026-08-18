@@ -15,6 +15,7 @@ CHROME_CFG = os.path.expanduser("~/.config/google-chrome")
 MARKER = os.path.expanduser("~/.config/i3/.chrome-launched")
 MARKER_WINDOW = 6.0
 OVERLAY = os.path.expanduser("~/.config/i3/window_names.json")
+RENAME_PIPE = os.path.expanduser("~/.config/i3/.rename_pipe")
 _prof_cache = {}
 _win_profiles = {}
 _name_overlay = {}
@@ -519,6 +520,12 @@ def main():
             fds = [proc.stdout, sys.stdin, refresh_fd]
             if inotify_fd is not None:
                 fds.append(inotify_fd)
+            rename_file = None
+            try:
+                rename_file = os.fdopen(os.open(RENAME_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb", buffering=0)
+                fds.append(rename_file)
+            except Exception:
+                pass
             for fd in (proc.stdout.fileno(), sys.stdin.fileno(), _refresh_pipe_r):
                 fl = fcntl.fcntl(fd, fcntl.F_GETFL)
                 fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
@@ -560,6 +567,23 @@ def main():
                         line, in_buf = in_buf.split("\n", 1)
                         if line:
                             handle_click(line)
+                            emit()
+                if rename_file is not None and rename_file in ready:
+                    try:
+                        data = rename_file.read(4096).decode(errors="replace")
+                    except (OSError, ValueError):
+                        data = ""
+                    for line in data.split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = line.split("\t", 1)
+                        if len(parts) == 2:
+                            xid_str, new_name = parts
+                            global _name_overlay
+                            _name_overlay[xid_str] = new_name
+                            save_overlay()
+                            _rebuild_apps()
                             emit()
         except Exception:
             time.sleep(1)

@@ -166,6 +166,9 @@ def save_overlay():
 
 def _collect_all_ids(node, out):
     out.add(str(node.get("id", "")))
+    xid = node.get("window")
+    if xid:
+        out.add(str(xid))
     for child in node.get("nodes", []) + node.get("floating_nodes", []):
         _collect_all_ids(child, out)
 
@@ -173,8 +176,12 @@ def _collect_all_ids(node, out):
 def collect_windows(node):
     out = []
     con_id = str(node.get("id", ""))
+    xid = node.get("window")
+    xid_str = str(xid) if xid else ""
     if con_id in _name_overlay:
         out.append(_name_overlay[con_id])
+    elif xid_str and xid_str in _name_overlay:
+        out.append(_name_overlay[xid_str])
     else:
         props = node.get("window_properties") or {}
         if props.get("class") == "Google-chrome":
@@ -333,11 +340,11 @@ def _bg_refresh():
             try:
                 tree = get_tree()
                 if tree:
-                known = set()
-                _collect_all_ids(tree, known)
-                changed = False
-                for con_id in list(_name_overlay.keys()):
-                    if con_id not in known:
+                    known = set()
+                    _collect_all_ids(tree, known)
+                    changed = False
+                    for con_id in list(_name_overlay.keys()):
+                        if con_id not in known:
                             del _name_overlay[con_id]
                             changed = True
                     if changed:

@@ -431,6 +431,11 @@ def handle_event(line):
         if con_id in _name_overlay:
             del _name_overlay[con_id]
             save_overlay()
+        if xid is not None:
+            xid_str = str(xid)
+            if xid_str in _name_overlay:
+                del _name_overlay[xid_str]
+                save_overlay()
         _refresh_event.set()
     elif change == "new":
         d = marker_directory()

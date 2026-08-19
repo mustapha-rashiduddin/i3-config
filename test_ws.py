@@ -78,5 +78,16 @@ class CloseEventTests(unittest.TestCase):
         self.assertEqual(ws._snapshot["apps"], {"j": []})
 
 
+class WindowLabelTests(unittest.TestCase):
+    def test_cosmic_term_uses_short_label(self):
+        node = {
+            "window_properties": {"class": "com.system76.CosmicTerm"},
+            "nodes": [],
+            "floating_nodes": [],
+        }
+
+        self.assertEqual(ws.collect_windows(node), ["te"])
+
+
 if __name__ == "__main__":
     unittest.main()

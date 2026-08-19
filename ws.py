@@ -202,6 +202,8 @@ def collect_windows(node):
         props = node.get("window_properties") or {}
         if props.get("class") == "Google-chrome":
             out.append(chrome_label(node.get("window")))
+        elif props.get("class") == "com.system76.CosmicTerm":
+            out.append("te")
         elif props.get("class"):
             out.append(props["class"])
     for child in node.get("nodes", []) + node.get("floating_nodes", []):

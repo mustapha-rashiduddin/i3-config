@@ -183,7 +183,6 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
         raise LoadoutError(f"cannot read loadout: {exc}") from exc
 
     entries: list[Entry] = []
-    shell = os.environ.get("SHELL") or "mksh"
     terminals = data.get("terminal", [])
     if not isinstance(terminals, list):
         raise LoadoutError("[[terminal]] must be an array of tables")
@@ -194,7 +193,7 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
         slot = item.get("slot")
         name = item.get("name")
         path = item.get("path", ".")
-        command = item.get("command", ["st", "-e", shell])
+        command = item.get("command", ["cosmic-term", "-e", "fish"])
         if slot not in ROW_KEYS:
             raise LoadoutError(f"terminal {n}: invalid slot {slot!r}")
         if not isinstance(name, str) or not name.strip():

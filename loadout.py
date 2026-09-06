@@ -583,12 +583,13 @@ def _ask_blockers(spec: Spec, obstacles: list[Window]) -> None:
 def heal(force: bool = False) -> int:
     """Verify and repair the engaged loadout; runs on a loadout-workspace switch.
 
-    Reads the spec from the `loadout:<root>` marks still on the windows, checks
-    every terminal is present by mark on its own workspace and the emacs on
-    its slot, then:
-      - asks (i3-nagbar) before killing foreign windows that block a workspace;
-      - sweeps for the emacs, moves it back to its slot (or launches one if
-        none exists) and recreates any missing or displaced terminal.
+    If no loadout is engaged (no `loadout:` marks) this is a no-op. Otherwise it
+    behaves like `load` re-run: every entry must sit, by its `loadout-win:`
+    mark, on its own workspace and the emacs on its slot. When everything is
+    fulfilled nothing happens; otherwise missing entries are launched and
+    displaced ones moved back, with foreign windows that block a workspace
+    killed only after an i3-nagbar confirmation (`--force` skips the ask).
+    Focus is returned to the workspace that was active when heal ran.
 
     Finishes and exits; nothing watches i3 in between.
     """
@@ -597,6 +598,7 @@ def heal(force: bool = False) -> int:
         return 0
     tree = get_tree()
     current = windows(tree)
+    stayed = focused_workspace(tree)
 
     emacs_entry = next((e for e in spec.entries if e.kind == "emacs"), None)
     emacs_con_id: int | None = None
@@ -648,6 +650,8 @@ def heal(force: bool = False) -> int:
         elif win.workspace != entry.slot:
             controller.claim(entry, win.con_id)
 
+    if stayed:
+        i3(f"workspace {quote(stayed)}")
     print(f"Loadout healthy: {spec.source}")
     return 0
 

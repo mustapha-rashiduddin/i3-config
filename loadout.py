@@ -138,20 +138,29 @@ def walk(node: dict[str, Any], workspace: str | None = None):
         yield from walk(child, workspace)
 
 
+def window_from(node: dict[str, Any], workspace: str) -> Window:
+    return Window(
+        con_id=int(node["id"]),
+        xid=int(node.get("window")),
+        pid=int(node["pid"]) if node.get("pid") is not None else None,
+        title=str(node.get("name") or ""),
+        workspace=workspace,
+        marks=tuple(node.get("marks") or ()),
+    )
+
+
+def window_class(node: dict[str, Any]) -> str:
+    props = node.get("window_properties") or {}
+    return str(props.get("class") or "")
+
+
 def windows(tree: dict[str, Any]) -> list[Window]:
     out: list[Window] = []
     for node, workspace in walk(tree):
         xid = node.get("window")
         if xid is None or not workspace or workspace == "__i3_scratch":
             continue
-        out.append(Window(
-            con_id=int(node["id"]),
-            xid=int(xid),
-            pid=int(node["pid"]) if node.get("pid") is not None else None,
-            title=str(node.get("name") or ""),
-            workspace=workspace,
-            marks=tuple(node.get("marks") or ()),
-        ))
+        out.append(window_from(node, workspace))
     return out
 
 
@@ -235,9 +244,45 @@ def occupied(spec: Spec, tree: dict[str, Any]) -> list[Window]:
     return [w for w in windows(tree) if w.workspace in spec.slots]
 
 
-def occupied_describe(spec: Spec) -> str:
+def plan(spec: Spec, tree: dict[str, Any]) -> tuple[dict[str, int], list[Window]]:
+    """Sweep for the first emacs window and adopt it into the emacs entry.
+
+    Returns the adopted map {entry.ident: con_id} (empty when the loadout has
+    no [emacs] entry or no emacs is open) and the remaining windows that still
+    occupy a target workspace and are not adopted (those are the only ones
+    needing killing).
+    """
+    adopted: dict[str, int] = {}
+    emacs_entry = next((e for e in spec.entries if e.kind == "emacs"), None)
+    if emacs_entry is not None:
+        for node, workspace in walk(tree):
+            node_ws = workspace or ""
+            if (window_class(node).lower() != "emacs" or not node_ws
+                    or node_ws == "__i3_scratch" or node.get("window") is None):
+                continue
+            adopted[emacs_entry.ident] = window_from(node, node_ws).con_id
+            break
+
+    adopted_ids = set(adopted.values())
+    leftover = [w for w in occupied(spec, tree) if w.con_id not in adopted_ids]
+    return adopted, leftover
+
+
+def apply_adoption(spec: Spec, adopted: dict[str, int], tree: dict[str, Any]) -> None:
+    """Move adopted windows to their slot. Emacs is never renamed."""
+    by_id = {w.con_id: w for w in windows(tree)}
+    entries = {e.ident: e for e in spec.entries}
+    for ident, con_id in adopted.items():
+        win = by_id.get(con_id)
+        entry = (win is not None) and entries.get(ident)
+        if win is None or entry is None:
+            continue
+        if win.workspace != entry.slot:
+            i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
+
+
+def occupied_describe(found: list[Window]) -> str:
     """One line per occupied window slot, for the confirmation prompt."""
-    found = occupied(spec, get_tree())
     if not found:
         return ""
     by_slot: dict[str, list[str]] = {}
@@ -375,9 +420,10 @@ def terminal_command(entry: Entry, private_title: str) -> list[str]:
 
 
 class Controller:
-    def __init__(self, spec: Spec, replace_ids: set[int]):
+    def __init__(self, spec: Spec, replace_ids: set[int], adopted: dict[str, int] | None = None):
         self.spec = spec
         self.replace_ids = replace_ids
+        self.adopted = adopted or {}
         self.stop = False
         self.original_workspace: str | None = None
         self.previous_workspace: dict[int, str] = {}
@@ -468,13 +514,32 @@ class Controller:
         i3(f"[con_id={win.con_id}] mark --add {quote(entry.mark)}")
         if win.workspace != entry.slot:
             i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
-        rename_window(win, entry.name)
+        # Only st terminals get renamed; emacs is always just Emacs.
+        if entry.kind == "terminal":
+            rename_window(win, entry.name)
+        self.launch_time[entry.ident] = time.monotonic()
+        self.next_spawn[entry.ident] = 0.0
+
+    def claim(self, entry: Entry, con_id: int) -> None:
+        """Adopt an existing window as this entry's managed instance."""
+        win = next((w for w in windows(get_tree()) if w.con_id == con_id), None)
+        if win is None:
+            self.launch(entry)
+            return
+        i3(f"[con_id={win.con_id}] mark --add {quote(entry.mark)}")
+        if win.workspace != entry.slot:
+            i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
+        if entry.kind == "terminal":
+            rename_window(win, entry.name)
         self.launch_time[entry.ident] = time.monotonic()
         self.next_spawn[entry.ident] = 0.0
 
     def initial_launch(self) -> None:
         for entry in self.spec.entries:
-            self.launch(entry)
+            if entry.ident in self.adopted:
+                self.claim(entry, self.adopted[entry.ident])
+            else:
+                self.launch(entry)
         if self.original_workspace:
             i3(f"workspace {quote(self.original_workspace)}")
         self.snapshot()
@@ -615,10 +680,14 @@ def lock(filename: str) -> int:
         return 1
 
     spec = load_spec(filename)
-    found = occupied(spec, get_tree())
-    if found and not prompt_replace(found):
+    tree = get_tree()
+    adopted, leftover = plan(spec, tree)
+    if leftover and not prompt_replace(leftover):
         print("Loadout not changed.")
         return 0
+
+    # Adopt before launching the daemon so the desktop reorganizes now.
+    apply_adoption(spec, adopted, get_tree())
 
     # The daemon is started before any confirmed target window is killed. This
     # matters when `lock loadout` is itself typed in a terminal that lives on a
@@ -626,8 +695,10 @@ def lock(filename: str) -> int:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     log = open(LOG_FILE, "a", buffering=1)
     argv = [sys.executable, str(Path(__file__).resolve()), "_serve", str(spec.source)]
-    if found:
-        argv += ["--replace", json.dumps([w.con_id for w in found])]
+    if leftover:
+        argv += ["--replace", json.dumps([w.con_id for w in leftover])]
+    if adopted:
+        argv += ["--adopt", json.dumps(adopted)]
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
@@ -681,7 +752,7 @@ def status() -> int:
     return 0
 
 
-def serve(filename: str, replace: str | None) -> int:
+def serve(filename: str, replace: str | None, adopt: str | None = None) -> int:
     spec = load_spec(filename)
     replace_ids: set[int] = set()
     if replace:
@@ -689,8 +760,14 @@ def serve(filename: str, replace: str | None) -> int:
             replace_ids = {int(x) for x in json.loads(replace)}
         except Exception as exc:
             raise LoadoutError("invalid replacement window list") from exc
+    adopted: dict[str, int] = {}
+    if adopt:
+        try:
+            adopted = {str(k): int(v) for k, v in json.loads(adopt).items()}
+        except Exception as exc:
+            raise LoadoutError("invalid adopted window list") from exc
 
-    controller = Controller(spec, replace_ids)
+    controller = Controller(spec, replace_ids, adopted)
 
     def stop(_signum, _frame):
         controller.stop = True
@@ -715,6 +792,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("_serve", help=argparse.SUPPRESS)
     p_serve.add_argument("file")
     p_serve.add_argument("--replace")
+    p_serve.add_argument("--adopt")
     p_occ = sub.add_parser("_occupied", help=argparse.SUPPRESS)
     p_occ.add_argument("file")
     return parser
@@ -737,9 +815,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcommand == "status":
             return status()
         if args.subcommand == "_serve":
-            return serve(args.file, args.replace)
+            return serve(args.file, args.replace, args.adopt)
         if args.subcommand == "_occupied":
-            description = occupied_describe(load_spec(args.file))
+            spec = load_spec(args.file)
+            _, leftover = plan(spec, get_tree())
+            description = occupied_describe(leftover)
             if description:
                 print(description)
                 return 1

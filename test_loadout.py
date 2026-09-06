@@ -55,6 +55,78 @@ name = "bad"
                 loadout.load_spec(file)
 
 
+class PlanTests(unittest.TestCase):
+    spec = None
+
+    def make_spec(self, text):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text(text)
+            return loadout.load_spec(file)
+
+    def tree(self, *windows):
+        return {
+            "id": 1,
+            "type": "root",
+            "nodes": [
+                {"id": 10, "type": "workspace", "name": "m", "nodes": list(windows), "floating_nodes": []},
+            ],
+            "floating_nodes": [],
+        }
+
+    @staticmethod
+    def node(cid, xid, cls, name):
+        return {"id": cid, "window": xid, "pid": None, "name": name,
+                "window_properties": {"class": cls},
+                "marks": [], "nodes": [], "floating_nodes": []}
+
+    def test_adopts_first_emacs_when_entry_exists(self):
+        spec = self.make_spec('''
+[emacs]
+slot = "l"
+''')
+        tree = self.tree(
+            self.node(31, 1003, "Emacs", "*scratch*"),
+            self.node(32, 1004, "Emacs", "*Messages*"),
+            self.node(11, 1001, "st-256color", "nvim"),
+        )
+        adopted, leftover = loadout.plan(spec, tree)
+        self.assertEqual(adopted, {"emacs:0": 31})
+        self.assertEqual(leftover, [])
+
+    def test_st_terminals_are_never_adopted(self):
+        spec = self.make_spec('''
+[[terminal]]
+slot = "j"
+name = "erd"
+
+[emacs]
+slot = "l"
+''')
+        tree = self.tree(
+            self.node(11, 1001, "st-256color", "nvim"),
+            self.node(12, 1002, "st", "mksh"),
+        )
+        adopted, leftover = loadout.plan(spec, tree)
+        self.assertEqual(adopted, {})
+        self.assertEqual(leftover, [])
+
+    def test_foreign_occupant_in_target_workspace_is_leftover(self):
+        spec = self.make_spec('''
+[[terminal]]
+slot = "j"
+name = "erd"
+''')
+        tree = self.tree(
+            self.node(11, 1001, "firefox", "firefox"),
+        )
+        tree["nodes"][0]["name"] = "j"
+        adopted, leftover = loadout.plan(spec, tree)
+        self.assertEqual(adopted, {})
+        self.assertEqual(len(leftover), 1)
+        self.assertEqual(leftover[0].workspace, "j")
+
+
 class TreeTests(unittest.TestCase):
     def tree(self):
         return {

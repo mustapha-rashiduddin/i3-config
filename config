@@ -62,15 +62,15 @@ set $ws8 "/"
 #set $ws15 "c"
 #set $ws16 "v"
 
-# switch to workspace
-bindsym $mod+j workspace $ws1
-bindsym $mod+k workspace $ws2
-bindsym $mod+l workspace $ws3
-bindsym $mod+semicolon workspace $ws4
-bindsym $mod+m workspace $ws5
-bindsym $mod+comma workspace $ws6
-bindsym $mod+period workspace $ws7
-bindsym $mod+slash workspace $ws8
+# switch to workspace (the loadout slots; heal the engaged loadout on arrival)
+bindsym $mod+j workspace $ws1; exec --no-startup-id ~/.config/i3/loadout.py heal
+bindsym $mod+k workspace $ws2; exec --no-startup-id ~/.config/i3/loadout.py heal
+bindsym $mod+l workspace $ws3; exec --no-startup-id ~/.config/i3/loadout.py heal
+bindsym $mod+semicolon workspace $ws4; exec --no-startup-id ~/.config/i3/loadout.py heal
+bindsym $mod+m workspace $ws5; exec --no-startup-id ~/.config/i3/loadout.py heal
+bindsym $mod+comma workspace $ws6; exec --no-startup-id ~/.config/i3/loadout.py heal
+bindsym $mod+period workspace $ws7; exec --no-startup-id ~/.config/i3/loadout.py heal
+bindsym $mod+slash workspace $ws8; exec --no-startup-id ~/.config/i3/loadout.py heal
 
 #bindsym $mod+a workspace $ws9
 #bindsym $mod+s workspace $ws10

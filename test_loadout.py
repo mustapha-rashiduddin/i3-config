@@ -197,26 +197,117 @@ class HelperTests(unittest.TestCase):
         self.assertIn('\\"quoted\\"', expression)
 
 
-class ReconcileTests(unittest.TestCase):
-    @patch.object(loadout, "get_tree", return_value={})
-    @patch.object(loadout, "i3")
-    def test_managed_window_is_pinned_and_foreign_window_is_ejected(self, i3, _get_tree):
+class ActiveSpecTests(unittest.TestCase):
+    def test_no_marks_means_no_active_loadout(self):
+        with patch.object(loadout, "windows", return_value=[]):
+            self.assertIsNone(loadout.active_spec())
+
+    def test_reads_root_from_marks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "loadout").write_text('''
+[[terminal]]
+slot = "j"
+name = "sql"
+
+[emacs]
+slot = "l"
+''')
+            win = loadout.Window(1, 100, None, "sql", "j", (f"loadout:{root}",))
+            with patch.object(loadout, "windows", return_value=[win]):
+                spec = loadout.active_spec()
+            self.assertEqual(spec.source, root / "loadout")
+            self.assertEqual(spec.entries[0].name, "sql")
+
+    def test_legacy_ident_marks_are_ignored(self):
+        win = loadout.Window(2, 101, None, "x", "j", ("loadout:terminal:0",))
+        with patch.object(loadout, "windows", return_value=[win]):
+            self.assertIsNone(loadout.active_spec())
+
+
+class HealTests(unittest.TestCase):
+    def test_noop_when_not_engaged(self):
+        with patch.object(loadout, "active_spec", return_value=None):
+            self.assertEqual(loadout.heal(), 0)
+
+    @patch.object(loadout.Controller, "launch")
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_force_relaunches_missing_entries(self, get_tree, windows, claim, launch):
+        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
+        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry, emacs))
+        get_tree.return_value = {}
+        windows.return_value = []
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(force=True), 0)
+        launch.assert_any_call(entry)
+        launch.assert_any_call(emacs)
+
+    @patch.object(loadout.Controller, "launch")
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_keeps_present_marked_terminals(self, get_tree, windows, claim, launch):
         entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
-        controller = loadout.Controller(spec, set())
-        controller.previous_workspace = {2: "m"}
-        controller.last_unprotected = "m"
-        managed = loadout.Window(1, 101, 10, "sql", "k", (entry.mark,))
-        foreign = loadout.Window(2, 102, 11, "foreign", "j", ())
-        refreshed = [
-            loadout.Window(1, 101, 10, "sql", "j", (entry.mark,)),
-            loadout.Window(2, 102, 11, "foreign", "m", ()),
-        ]
-        with patch.object(loadout, "windows", side_effect=[[managed, foreign], refreshed]):
-            controller.reconcile()
-        calls = [call.args[0] for call in i3.call_args_list]
-        self.assertIn('[con_id=1] move container to workspace "j"', calls)
-        self.assertIn('[con_id=2] move container to workspace "m"', calls)
+        get_tree.return_value = {}
+        win = loadout.Window(1, 100, None, "x", "j", ("loadout:/tmp", "loadout-win:terminal:0"))
+        windows.return_value = [win]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(force=True), 0)
+        launch.assert_not_called()
+        claim.assert_not_called()
+
+    @patch.object(loadout.Controller, "launch")
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_moves_displaced_marked_terminal_back(self, get_tree, windows, claim, launch):
+        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        get_tree.return_value = {}
+        win = loadout.Window(1, 100, None, "x", "k", ("loadout:/tmp", "loadout-win:terminal:0"))
+        windows.return_value = [win]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(force=True), 0)
+        launch.assert_not_called()
+        claim.assert_called_once_with(entry, win.con_id)
+
+    @patch.object(loadout, "subprocess")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_obstacles_ask_via_nagbar(self, get_tree, windows, subproc):
+        spec = loadout.Spec(
+            Path("/tmp/loadout"), Path("/tmp"),
+            (loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",)),),
+        )
+        blocked = loadout.Window(1, 100, None, "firefox", "j", ())
+        get_tree.return_value = {}
+        windows.return_value = [blocked]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 1)
+        subproc.Popen.assert_called_once()
+        argv = subproc.Popen.call_args[0][0]
+        self.assertEqual(argv[0], "i3-nagbar")
+        self.assertTrue(any("heal --force" in arg for arg in argv))
+
+    @patch.object(loadout.Controller, "launch")
+    @patch.object(loadout, "kill_windows")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_force_kills_obstacles(self, get_tree, windows, kill, launch):
+        spec = loadout.Spec(
+            Path("/tmp/loadout"), Path("/tmp"),
+            (loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",)),),
+        )
+        blocked = loadout.Window(1, 100, None, "firefox", "j", ())
+        get_tree.return_value = {}
+        windows.return_value = [blocked]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(force=True), 0)
+        kill.assert_called_once_with([blocked])
 
 
 if __name__ == "__main__":

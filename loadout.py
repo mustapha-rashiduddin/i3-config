@@ -25,8 +25,20 @@ Run directly as:
     python3 loadout.py lock ./loadout
     python3 loadout.py unload
 
-If this file is exposed on PATH as `load`/`unload`, it also understands those
+If this file is exposed on PATH as `lock`/`unload`, it also understands those
 invocation names, so the intended shell UX is simply `load <dir>`.
+
+`lock` materializes the loadout once: it adopts the first emacs, launches
+missing entries, and drops confirmed leftover windows, then exits. No daemon
+watches i3 afterwards — closing any window (terminals included) keeps it
+closed. `unload` simply clears the loadout marks.
+
+`heal` is triggered by the i3 keybindings that switch to a loadout workspace.
+It finds the engaged loadout via the `loadout:<root>` marks left on the windows
+(the root is kept in i3's RAM, never written to a file), re-reads the TOML, and
+repairs the layout on demand: each entry is located by its unique
+`loadout-win:<ident>` mark, moved back to its slot or relaunched if its window
+is gone, asking before killing anything that blocks a workspace.
 """
 
 from __future__ import annotations
@@ -35,7 +47,6 @@ import argparse
 import errno
 import json
 import os
-import select
 import signal
 import subprocess
 import sys
@@ -47,18 +58,14 @@ from typing import Any
 
 ROW_KEYS = ("j", "k", "l", ";", "m", ",", ".", "/")
 MARK_PREFIX = "loadout:"
+WINDOW_MARK_PREFIX = "loadout-win:"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "i3-loadout"
 STATE_FILE = CACHE_DIR / "state.json"
-LOG_FILE = CACHE_DIR / "loadout.log"
 RENAME_PIPE = Path.home() / ".config/i3/.rename_pipe"
 OVERLAY = Path.home() / ".config/i3/window_names.json"
 
 
 class LoadoutError(RuntimeError):
-    pass
-
-
-class StopRequested(Exception):
     pass
 
 
@@ -268,17 +275,28 @@ def plan(spec: Spec, tree: dict[str, Any]) -> tuple[dict[str, int], list[Window]
     return adopted, leftover
 
 
-def apply_adoption(spec: Spec, adopted: dict[str, int], tree: dict[str, Any]) -> None:
-    """Move adopted windows to their slot. Emacs is never renamed."""
-    by_id = {w.con_id: w for w in windows(tree)}
-    entries = {e.ident: e for e in spec.entries}
-    for ident, con_id in adopted.items():
-        win = by_id.get(con_id)
-        entry = (win is not None) and entries.get(ident)
-        if win is None or entry is None:
+def active_spec() -> Spec | None:
+    """Return the engaged loadout spec, located via the `loadout:<root>` i3 marks.
+
+    The loadout root lives only in i3's tree (RAM), never in a file, so it stays
+    engaged for as long as any of its windows exists.
+    """
+    roots: set[str] = set()
+    for win in windows(get_tree()):
+        for mark in win.marks:
+            if mark.startswith(MARK_PREFIX):
+                root = mark[len(MARK_PREFIX):]
+                if root:
+                    roots.add(root)
+    for root in sorted(roots):
+        source = Path(root) / "loadout"
+        if not source.is_file():
+            source = Path(root) / "loadout.toml"
+        try:
+            return load_spec(source)
+        except LoadoutError:
             continue
-        if win.workspace != entry.slot:
-            i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
+    return None
 
 
 def occupied_describe(found: list[Window]) -> str:
@@ -306,44 +324,6 @@ def prompt_replace(found: list[Window]) -> bool:
     return answer in {"y", "yes"}
 
 
-def atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n")
-    os.replace(tmp, path)
-
-
-def read_state() -> dict[str, Any] | None:
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return None
-
-
-def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
-def active_state() -> dict[str, Any] | None:
-    state = read_state()
-    if not state:
-        return None
-    try:
-        pid = int(state["pid"])
-    except Exception:
-        return None
-    if pid_alive(pid):
-        return state
-    STATE_FILE.unlink(missing_ok=True)
-    return None
-
-
 def clear_marks() -> None:
     try:
         all_windows = windows(get_tree())
@@ -351,7 +331,7 @@ def clear_marks() -> None:
         return
     for win in all_windows:
         for mark in win.marks:
-            if mark.startswith(MARK_PREFIX):
+            if mark.startswith(MARK_PREFIX) or mark.startswith(WINDOW_MARK_PREFIX):
                 try:
                     i3(f"[con_id={win.con_id}] unmark {quote(mark)}")
                 except LoadoutError:
@@ -419,47 +399,33 @@ def terminal_command(entry: Entry, private_title: str) -> list[str]:
     return command
 
 
+def kill_windows(victims: list[Window]) -> None:
+    """Kill confirmed leftover windows and wait for them to close."""
+    for win in victims:
+        i3(f"[con_id={win.con_id}] kill")
+    if not victims:
+        return
+    deadline = time.monotonic() + 5.0
+    victim_ids = {w.con_id for w in victims}
+    while time.monotonic() < deadline:
+        live = {w.con_id for w in windows(get_tree())}
+        if victim_ids.isdisjoint(live):
+            break
+        time.sleep(0.05)
+
+
 class Controller:
-    def __init__(self, spec: Spec, replace_ids: set[int], adopted: dict[str, int] | None = None):
+    """One-shot materializer: adopt existing windows and launch missing ones.
+
+    Runs only during `lock`; no daemon is left behind, so nothing is pinned,
+    watched, or restarted when a window is closed afterwards.
+    """
+
+    def __init__(self, spec: Spec, adopted: dict[str, int] | None = None):
         self.spec = spec
-        self.replace_ids = replace_ids
         self.adopted = adopted or {}
-        self.stop = False
         self.original_workspace: str | None = None
-        self.previous_workspace: dict[int, str] = {}
-        self.last_unprotected: str | None = None
-        self.next_spawn = {e.ident: 0.0 for e in spec.entries}
-        self.launch_time = {e.ident: 0.0 for e in spec.entries}
-        self.by_mark = {e.mark: e for e in spec.entries}
-
-    def write_state(self, status: str) -> None:
-        atomic_json(STATE_FILE, {
-            "pid": os.getpid(),
-            "status": status,
-            "loadout": str(self.spec.source),
-            "root": str(self.spec.root),
-            "protected_slots": sorted(self.spec.slots, key=ROW_KEYS.index),
-        })
-
-    def prepare(self) -> None:
-        clear_marks()
-        tree = get_tree()
-        self.original_workspace = focused_workspace(tree)
-        victims = [w for w in windows(tree) if w.con_id in self.replace_ids]
-        for win in victims:
-            # Deliberately target only the windows seen during the confirmation
-            # prompt. Workspaces outside the loadout are never touched.
-            i3(f"[con_id={win.con_id}] kill")
-        if victims:
-            deadline = time.monotonic() + 5.0
-            victim_ids = {w.con_id for w in victims}
-            while time.monotonic() < deadline:
-                live = {w.con_id for w in windows(get_tree())}
-                if victim_ids.isdisjoint(live):
-                    break
-                time.sleep(0.05)
-            else:
-                raise LoadoutError("one or more target windows did not close")
+        self.mark = MARK_PREFIX + str(spec.root)
 
     def launch(self, entry: Entry) -> None:
         before = {w.con_id for w in windows(get_tree())}
@@ -511,14 +477,13 @@ class Controller:
             if planted.returncode != 0:
                 raise LoadoutError(planted.stderr.strip() or "could not plant Emacs workspace")
 
-        i3(f"[con_id={win.con_id}] mark --add {quote(entry.mark)}")
+        i3(f"[con_id={win.con_id}] mark --add {quote(self.mark)}")
+        i3(f"[con_id={win.con_id}] mark --add {quote(WINDOW_MARK_PREFIX + entry.ident)}")
         if win.workspace != entry.slot:
             i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
         # Only st terminals get renamed; emacs is always just Emacs.
         if entry.kind == "terminal":
             rename_window(win, entry.name)
-        self.launch_time[entry.ident] = time.monotonic()
-        self.next_spawn[entry.ident] = 0.0
 
     def claim(self, entry: Entry, con_id: int) -> None:
         """Adopt an existing window as this entry's managed instance."""
@@ -526,13 +491,12 @@ class Controller:
         if win is None:
             self.launch(entry)
             return
-        i3(f"[con_id={win.con_id}] mark --add {quote(entry.mark)}")
+        i3(f"[con_id={win.con_id}] mark --add {quote(self.mark)}")
+        i3(f"[con_id={win.con_id}] mark --add {quote(WINDOW_MARK_PREFIX + entry.ident)}")
         if win.workspace != entry.slot:
             i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
         if entry.kind == "terminal":
             rename_window(win, entry.name)
-        self.launch_time[entry.ident] = time.monotonic()
-        self.next_spawn[entry.ident] = 0.0
 
     def initial_launch(self) -> None:
         for entry in self.spec.entries:
@@ -542,143 +506,16 @@ class Controller:
                 self.launch(entry)
         if self.original_workspace:
             i3(f"workspace {quote(self.original_workspace)}")
-        self.snapshot()
-
-    def snapshot(self) -> list[Window]:
-        tree = get_tree()
-        current = windows(tree)
-        self.previous_workspace = {w.con_id: w.workspace for w in current}
-        focused = focused_workspace(tree)
-        if focused and focused not in self.spec.slots:
-            self.last_unprotected = focused
-        if self.last_unprotected is None:
-            self.last_unprotected = next((x for x in ROW_KEYS if x not in self.spec.slots), None)
-        return current
-
-    def entry_for(self, win: Window) -> Entry | None:
-        for mark in win.marks:
-            entry = self.by_mark.get(mark)
-            if entry:
-                return entry
-        return None
-
-    def safe_workspace(self) -> str | None:
-        if self.last_unprotected and self.last_unprotected not in self.spec.slots:
-            return self.last_unprotected
-        return next((x for x in ROW_KEYS if x not in self.spec.slots), None)
-
-    def reconcile(self) -> None:
-        current = windows(get_tree())
-        seen: set[str] = set()
-
-        # Managed windows are pinned to their declared workspace.
-        for win in current:
-            entry = self.entry_for(win)
-            if not entry:
-                continue
-            seen.add(entry.ident)
-            if win.workspace != entry.slot:
-                i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
-
-        # Foreign windows cannot remain in a protected loadout workspace.
-        fallback = self.safe_workspace()
-        for win in current:
-            if win.workspace not in self.spec.slots or self.entry_for(win):
-                continue
-            old = self.previous_workspace.get(win.con_id)
-            destination = old if old and old not in self.spec.slots else fallback
-            if destination:
-                i3(f"[con_id={win.con_id}] move container to workspace {quote(destination)}")
-            else:
-                i3(f"[con_id={win.con_id}] move scratchpad")
-
-        # A closed/crashed managed application is recreated. Back off if a bad
-        # command exits immediately so the controller cannot create a fork loop.
-        now = time.monotonic()
-        for entry in self.spec.entries:
-            if entry.ident in seen or now < self.next_spawn[entry.ident]:
-                continue
-            try:
-                self.launch(entry)
-            except LoadoutError as exc:
-                self.next_spawn[entry.ident] = time.monotonic() + 5.0
-                print(f"loadout: failed to restore {entry.name}: {exc}", file=sys.stderr, flush=True)
-
-        self.previous_workspace = {w.con_id: w.workspace for w in windows(get_tree())}
-
-    def note_close(self, event: dict[str, Any]) -> None:
-        marks = (event.get("container") or {}).get("marks") or []
-        for mark in marks:
-            entry = self.by_mark.get(mark)
-            if not entry:
-                continue
-            # If a freshly started application immediately dies, give it a few
-            # seconds before retrying. Otherwise heal on the close event.
-            age = time.monotonic() - self.launch_time[entry.ident]
-            self.next_spawn[entry.ident] = time.monotonic() + (5.0 if age < 2.0 else 0.0)
-
-    def handle_event(self, line: str) -> None:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return
-        change = event.get("change")
-        if change == "focus" and (event.get("current") or {}).get("type") == "workspace":
-            slot = (event.get("current") or {}).get("name")
-            if slot and slot not in self.spec.slots:
-                self.last_unprotected = slot
-            return
-        if change == "close":
-            self.note_close(event)
-        if change in {"new", "move", "close"}:
-            try:
-                self.reconcile()
-            except LoadoutError as exc:
-                print(f"loadout: reconcile failed: {exc}", file=sys.stderr, flush=True)
-
-    def cleanup(self) -> None:
-        clear_marks()
-        state = read_state()
-        if state and int(state.get("pid", -1)) == os.getpid():
-            STATE_FILE.unlink(missing_ok=True)
-
-    def serve(self) -> None:
-        self.write_state("starting")
-        try:
-            self.prepare()
-            self.initial_launch()
-            self.write_state("ready")
-            proc = subprocess.Popen(
-                ["i3-msg", "-t", "subscribe", "-m", '["workspace","window","shutdown"]'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
-            )
-            if proc.stdout is None:
-                raise LoadoutError("could not subscribe to i3 events")
-            while not self.stop and proc.poll() is None:
-                ready, _, _ = select.select([proc.stdout], [], [], 10.0)
-                if proc.stdout in ready:
-                    line = proc.stdout.readline()
-                    if line:
-                        self.handle_event(line)
-                else:
-                    # Events are the primary mechanism. This slow safety pass
-                    # also handles retry/backoff and any missed IPC event.
-                    self.reconcile()
-            proc.terminate()
-        finally:
-            self.cleanup()
 
 
 def lock(filename: str) -> int:
-    state = active_state()
-    if state:
-        print(f"A loadout is already locked: {state.get('loadout', '?')}")
-        print("Run `unload` first.")
-        return 1
+    """Materialize the loadout once, then exit.
 
+    One-shot: kill confirmed leftover windows first, then adopt the first emacs,
+    launch missing entries, and exit. Nothing runs afterwards — no daemon, no
+    watcher, no restarting of closed windows.
+    """
+    STATE_FILE.unlink(missing_ok=True)
     spec = load_spec(filename)
     tree = get_tree()
     adopted, leftover = plan(spec, tree)
@@ -686,119 +523,155 @@ def lock(filename: str) -> int:
         print("Loadout not changed.")
         return 0
 
-    # Adopt before launching the daemon so the desktop reorganizes now.
-    apply_adoption(spec, adopted, get_tree())
-
-    # The daemon is started before any confirmed target window is killed. This
-    # matters when `lock loadout` is itself typed in a terminal that lives on a
-    # target workspace: killing that terminal must not kill the controller.
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    log = open(LOG_FILE, "a", buffering=1)
-    argv = [sys.executable, str(Path(__file__).resolve()), "_serve", str(spec.source)]
-    if leftover:
-        argv += ["--replace", json.dumps([w.con_id for w in leftover])]
-    if adopted:
-        argv += ["--adopt", json.dumps(adopted)]
-    proc = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=log,
-        start_new_session=True,
-    )
-    atomic_json(STATE_FILE, {
-        "pid": proc.pid,
-        "status": "starting",
-        "loadout": str(spec.source),
-        "root": str(spec.root),
-        "protected_slots": sorted(spec.slots, key=ROW_KEYS.index),
-    })
-    print(f"Locking loadout: {spec.source}")
+    clear_marks()
+    controller = Controller(spec, adopted)
+    controller.original_workspace = focused_workspace(tree)
+    # Kill the confirmed occupants before anything else: a `load` typed in a
+    # terminal that lives on a target workspace kills that terminal, and main()
+    # ignores the resulting SIGHUP so the controller survives it. Killing first
+    # also means a later failed launch (e.g. an unreachable emacs server) cannot
+    # leave the confirmed occupants alive. Victims on the caller's own workspace
+    # are killed last for good measure.
+    leftover = sorted(leftover, key=lambda w: w.workspace == controller.original_workspace)
+    kill_windows(leftover)
+    try:
+        controller.initial_launch()
+    except LoadoutError:
+        raise
+    try:
+        print(f"Locking loadout: {spec.source}")
+    except BrokenPipeError:
+        pass
     return 0
 
 
 def unload() -> int:
-    state = active_state()
-    if not state:
-        clear_marks()
-        print("No loadout is locked.")
-        return 0
-    pid = int(state["pid"])
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        STATE_FILE.unlink(missing_ok=True)
-        clear_marks()
-        print("No loadout is locked.")
-        return 0
-
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline and pid_alive(pid):
-        time.sleep(0.05)
+    STATE_FILE.unlink(missing_ok=True)
     clear_marks()
-    if pid_alive(pid):
-        print("Unload requested; controller is still shutting down.")
-    else:
-        print("Loadout unloaded. Windows were left open.")
+    print("Loadout unloaded. Windows were left open.")
     return 0
 
 
 def status() -> int:
-    state = active_state()
-    if not state:
-        print("unloaded")
+    print("unloaded")
+    return 1
+
+
+def _ask_blockers(spec: Spec, obstacles: list[Window]) -> None:
+    """Ask, via i3-nagbar, whether to kill the windows blocking the loadout.
+
+    `heal` runs from an i3 keybinding (exec), so there is no terminal to read an
+    answer from; the nagbar buttons re-run heal with `--force` (kill) or do
+    nothing.
+    """
+    by_slot: dict[str, list[str]] = {}
+    for win in obstacles:
+        by_slot.setdefault(win.workspace, []).append(win.title or str(win.xid))
+    slots = "; ".join(f"{s}: {', '.join(names)}" for s, names in sorted(by_slot.items()))
+    command = " ".join([
+        "i3-msg", "exec", "--no-startup-id",
+        f"{sys.executable} {Path(__file__).absolute()} heal --force",
+    ])
+    subprocess.Popen([
+        "i3-nagbar", "-t", "warning",
+        "-m", f"Loadout workspace(s) occupied ({slots}). Kill and restore?",
+        "-B", "Kill & heal", command,
+        "-B", "Leave it", "true",
+    ])
+
+
+def heal(force: bool = False) -> int:
+    """Verify and repair the engaged loadout; runs on a loadout-workspace switch.
+
+    Reads the spec from the `loadout:<root>` marks still on the windows, checks
+    every terminal is present by mark on its own workspace and the emacs on
+    its slot, then:
+      - asks (i3-nagbar) before killing foreign windows that block a workspace;
+      - sweeps for the emacs, moves it back to its slot (or launches one if
+        none exists) and recreates any missing or displaced terminal.
+
+    Finishes and exits; nothing watches i3 in between.
+    """
+    spec = active_spec()
+    if spec is None:
+        return 0
+    tree = get_tree()
+    current = windows(tree)
+
+    emacs_entry = next((e for e in spec.entries if e.kind == "emacs"), None)
+    emacs_con_id: int | None = None
+    for node, workspace in walk(tree):
+        if node.get("window") is not None and window_class(node).lower() == "emacs":
+            emacs_con_id = int(node["id"])
+            break
+
+    # Membership is per-entry: each managed window carries a unique
+    # `loadout-win:<ident>` mark (the `loadout:<root>` beacon migrates between
+    # windows by design — i3 keeps one window per mark name — so it is useless
+    # for enumeration). The pretty entry names only live in ws.py's rename
+    # overlay, never in the i3 tree.
+    present: dict[str, Window] = {}
+    for w in current:
+        for mark in w.marks:
+            if mark.startswith(WINDOW_MARK_PREFIX):
+                present[mark[len(WINDOW_MARK_PREFIX):]] = w
+
+    managed = {w.con_id for w in present.values()}
+    if emacs_con_id is not None:
+        managed.add(emacs_con_id)
+
+    obstacles = [w for w in current if w.workspace in spec.slots and w.con_id not in managed]
+    if obstacles and not force:
+        _ask_blockers(spec, obstacles)
         return 1
-    print(f"{state.get('status', 'active')}: {state.get('loadout', '?')}")
-    return 0
 
+    controller = Controller(spec)
+    if obstacles:
+        kill_windows(obstacles)
 
-def serve(filename: str, replace: str | None, adopt: str | None = None) -> int:
-    spec = load_spec(filename)
-    replace_ids: set[int] = set()
-    if replace:
-        try:
-            replace_ids = {int(x) for x in json.loads(replace)}
-        except Exception as exc:
-            raise LoadoutError("invalid replacement window list") from exc
-    adopted: dict[str, int] = {}
-    if adopt:
-        try:
-            adopted = {str(k): int(v) for k, v in json.loads(adopt).items()}
-        except Exception as exc:
-            raise LoadoutError("invalid adopted window list") from exc
+    if emacs_entry is not None:
+        win = present.get(emacs_entry.ident)
+        if win is None:
+            if emacs_con_id is not None and emacs_con_id not in managed:
+                controller.claim(emacs_entry, emacs_con_id)
+            else:
+                controller.launch(emacs_entry)
+        elif win.workspace != emacs_entry.slot:
+            controller.claim(emacs_entry, win.con_id)
 
-    controller = Controller(spec, replace_ids, adopted)
+    for entry in spec.entries:
+        if entry.kind != "terminal":
+            continue
+        win = present.get(entry.ident)
+        if win is None:
+            controller.launch(entry)
+        elif win.workspace != entry.slot:
+            controller.claim(entry, win.con_id)
 
-    def stop(_signum, _frame):
-        controller.stop = True
-        raise StopRequested()
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-    try:
-        controller.serve()
-    except StopRequested:
-        controller.cleanup()
+    print(f"Loadout healthy: {spec.source}")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="materialize and protect an i3 project loadout")
+    parser = argparse.ArgumentParser(description="materialize an i3 project loadout")
     sub = parser.add_subparsers(dest="subcommand")
     p_lock = sub.add_parser("lock")
     p_lock.add_argument("file")
     sub.add_parser("unload")
     sub.add_parser("status")
-    p_serve = sub.add_parser("_serve", help=argparse.SUPPRESS)
-    p_serve.add_argument("file")
-    p_serve.add_argument("--replace")
-    p_serve.add_argument("--adopt")
+    p_heal = sub.add_parser("heal")
+    p_heal.add_argument("--force", action="store_true")
     p_occ = sub.add_parser("_occupied", help=argparse.SUPPRESS)
     p_occ.add_argument("file")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    # When `load` is typed inside a terminal that lives on a target workspace,
+    # killing that terminal closes its pty and hangs up the session, which would
+    # SIGHUP this process mid-`kill_windows`. The controller must outlive its
+    # own terminal, so ignore the hangup for the whole run.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
     argv = list(sys.argv[1:] if argv is None else argv)
     invoked_as = Path(sys.argv[0]).name
     if invoked_as == "lock":
@@ -814,8 +687,8 @@ def main(argv: list[str] | None = None) -> int:
             return unload()
         if args.subcommand == "status":
             return status()
-        if args.subcommand == "_serve":
-            return serve(args.file, args.replace, args.adopt)
+        if args.subcommand == "heal":
+            return heal(args.force)
         if args.subcommand == "_occupied":
             spec = load_spec(args.file)
             _, leftover = plan(spec, get_tree())

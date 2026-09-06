@@ -496,6 +496,29 @@ def emacs_plant_matches(path: Path) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "t"
 
 
+SD_DB = Path.home() / "emacs-speed-dial" / "speed-dial.sqlite"
+
+
+def planted_db_root() -> Path | None:
+    """The plant the speed-dial database records as global_workspace.
+
+    Both emacs anchoring and the standalone shell `plant` write this row; the
+    shell command never touches the running emacs, so a DB-only drift is only
+    visible here and must be reconciled from the loadout side.
+    """
+    if not SD_DB.is_file():
+        return None
+    try:
+        result = run(["sqlite3", str(SD_DB),
+                      "SELECT value FROM state WHERE key='global_workspace'"], timeout=2.0)
+    except LoadoutError:
+        return None
+    if result.returncode != 0:
+        return None
+    rows = result.stdout.splitlines()
+    return Path(rows[0]) if rows else None
+
+
 def restore_emacs_plant(path: Path) -> bool:
     """Plant the Emacs server on `path` via the loadout entry function."""
     try:
@@ -787,7 +810,11 @@ def heal(force: bool = False) -> int:
     if emacs_entry is not None:
         win = present.get(emacs_entry.ident)
         if win is not None or emacs_con_id is not None:
-            if not emacs_plant_matches(emacs_entry.cwd):
+            drifted = not emacs_plant_matches(emacs_entry.cwd)
+            db_root = planted_db_root()
+            if db_root is not None and os.path.realpath(db_root) != os.path.realpath(emacs_entry.cwd):
+                drifted = True
+            if drifted:
                 if restore_emacs_plant(emacs_entry.cwd):
                     print(f"  emacs {emacs_entry.ident}: plant -> {emacs_entry.cwd}")
 

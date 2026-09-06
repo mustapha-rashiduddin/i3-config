@@ -342,8 +342,9 @@ class HealTests(unittest.TestCase):
     @patch.object(loadout.Controller, "claim")
     @patch.object(loadout, "windows")
     @patch.object(loadout, "emacs_plant_matches", return_value=True)
+    @patch.object(loadout, "planted_db_root", return_value=None)
     @patch.object(loadout, "get_tree")
-    def test_extra_window_on_healthy_emacs_slot_does_not_nag(self, get_tree, matches, windows, claim, subproc):
+    def test_extra_window_on_healthy_emacs_slot_does_not_nag(self, get_tree, db, matches, windows, claim, subproc):
         emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
         marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
@@ -413,10 +414,11 @@ class HealTests(unittest.TestCase):
 
     @patch.object(loadout, "restore_emacs_plant")
     @patch.object(loadout, "emacs_plant_matches", return_value=False)
+    @patch.object(loadout, "planted_db_root", return_value=None)
     @patch.object(loadout.Controller, "claim")
     @patch.object(loadout, "windows")
     @patch.object(loadout, "get_tree")
-    def test_heal_replants_misplanted_emacs(self, get_tree, windows, claim, matches, restore):
+    def test_heal_replants_misplanted_emacs(self, get_tree, windows, claim, db, matches, restore):
         emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
         marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
@@ -430,10 +432,45 @@ class HealTests(unittest.TestCase):
 
     @patch.object(loadout, "restore_emacs_plant")
     @patch.object(loadout, "emacs_plant_matches", return_value=True)
+    @patch.object(loadout, "planted_db_root", return_value=Path("/elsewhere"))
     @patch.object(loadout.Controller, "claim")
     @patch.object(loadout, "windows")
     @patch.object(loadout, "get_tree")
-    def test_heal_checks_plant_for_claimed_emacs(self, get_tree, windows, claim, matches, restore):
+    def test_heal_replants_db_when_plant_drifted(self, get_tree, windows, claim, db, matches, restore):
+        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
+                                ("loadout:/tmp", "loadout-win:emacs:0"))
+        get_tree.return_value = {}
+        windows.return_value = [marked]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 0)
+        restore.assert_called_once_with(Path("/tmp"))
+
+    @patch.object(loadout, "restore_emacs_plant")
+    @patch.object(loadout, "emacs_plant_matches", return_value=True)
+    @patch.object(loadout, "planted_db_root", return_value=Path("/tmp"))
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_does_not_replant_when_everything_matches(self, get_tree, windows, claim, db, matches, restore):
+        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
+                                ("loadout:/tmp", "loadout-win:emacs:0"))
+        get_tree.return_value = {}
+        windows.return_value = [marked]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 0)
+        restore.assert_not_called()
+
+    @patch.object(loadout, "restore_emacs_plant")
+    @patch.object(loadout, "emacs_plant_matches", return_value=True)
+    @patch.object(loadout, "planted_db_root", return_value=None)
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_checks_plant_for_claimed_emacs(self, get_tree, windows, claim, db, matches, restore):
         emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
         get_tree.return_value = {

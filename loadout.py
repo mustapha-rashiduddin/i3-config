@@ -193,7 +193,7 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
         slot = item.get("slot")
         name = item.get("name")
         path = item.get("path", ".")
-        command = item.get("command", ["ghostty", "-e", "fish"])
+        command = item.get("command", ["st", "-e", "mksh"])
         if slot not in ROW_KEYS:
             raise LoadoutError(f"terminal {n}: invalid slot {slot!r}")
         if not isinstance(name, str) or not name.strip():

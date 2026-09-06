@@ -414,6 +414,18 @@ def kill_windows(victims: list[Window]) -> None:
         time.sleep(0.05)
 
 
+def stop_process(proc: subprocess.Popen[bytes]) -> None:
+    """Terminate a just-spawned process and fall back to SIGKILL."""
+    try:
+        proc.terminate()
+        proc.wait(timeout=5.0)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 class Controller:
     """One-shot materializer: adopt existing windows and launch missing ones.
 
@@ -448,20 +460,31 @@ class Controller:
             win = wait_new(before, pid=proc.pid, title=title)
         else:
             client = run(["emacsclient", "--eval", "t"], timeout=2.0)
+            spawned: subprocess.Popen[bytes] | None = None
             if client.returncode == 0:
                 frame = f"((name . {elisp_string(title)}))"
                 result = run(["emacsclient", "-c", "-n", "-F", frame])
                 if result.returncode != 0:
                     raise LoadoutError(result.stderr.strip() or "emacsclient could not create a frame")
                 win = wait_new(before, title=title)
+                planted = run(["emacsclient", "--eval", emacs_plant(entry.cwd)])
+                if planted.returncode != 0:
+                    raise LoadoutError(planted.stderr.strip() or "could not plant Emacs workspace")
             else:
+                # No reachable server: spawn a fresh emacs that owns this
+                # loadout. It plants itself inline in the --eval (no separate
+                # emacsclient round-trip afterwards — that would race the server
+                # while it is still starting up and could be misread as a failed
+                # launch, killing the very emacs we just started).
                 expr = (
                     "(progn "
-                    f"(set-frame-parameter nil 'name {elisp_string(title)}) "
-                    f"{emacs_plant(entry.cwd)})"
+                    "(require 'server) "
+                    "(unless (server-running-p) (server-start)) "
+                    f"{emacs_plant(entry.cwd)} "
+                    f"(set-frame-parameter nil 'name {elisp_string(title)}))"
                 )
                 try:
-                    proc = subprocess.Popen(
+                    spawned = subprocess.Popen(
                         ["emacs", "--eval", expr],
                         cwd=entry.cwd,
                         stdin=subprocess.DEVNULL,
@@ -471,11 +494,11 @@ class Controller:
                     )
                 except FileNotFoundError as exc:
                     raise LoadoutError("emacs is not installed") from exc
-                win = wait_new(before, pid=proc.pid, title=title, timeout=15.0)
-
-            planted = run(["emacsclient", "--eval", emacs_plant(entry.cwd)])
-            if planted.returncode != 0:
-                raise LoadoutError(planted.stderr.strip() or "could not plant Emacs workspace")
+                try:
+                    win = wait_new(before, pid=spawned.pid, title=title, timeout=20.0)
+                except LoadoutError:
+                    stop_process(spawned)
+                    raise
 
         i3(f"[con_id={win.con_id}] mark --add {quote(self.mark)}")
         i3(f"[con_id={win.con_id}] mark --add {quote(WINDOW_MARK_PREFIX + entry.ident)}")
@@ -619,7 +642,12 @@ def heal(force: bool = False) -> int:
                 present[mark[len(WINDOW_MARK_PREFIX):]] = w
 
     managed = {w.con_id for w in present.values()}
-    if emacs_con_id is not None:
+    # The emacs may lack its `loadout-win:` mark (e.g. an aborted fallback
+    # launch left it orphaned). Such an emacs is about to be claimed below, so
+    # do not treat it as an obstacle. Only do this when no window carries the
+    # emacs mark; once a marked emacs exists every other emacs is foreign.
+    if (emacs_entry is not None and emacs_con_id is not None
+            and emacs_entry.ident not in present and emacs_con_id not in managed):
         managed.add(emacs_con_id)
 
     obstacles = [w for w in current if w.workspace in spec.slots and w.con_id not in managed]
@@ -634,7 +662,7 @@ def heal(force: bool = False) -> int:
     if emacs_entry is not None:
         win = present.get(emacs_entry.ident)
         if win is None:
-            if emacs_con_id is not None and emacs_con_id not in managed:
+            if emacs_con_id is not None:
                 controller.claim(emacs_entry, emacs_con_id)
             else:
                 controller.launch(emacs_entry)

@@ -1,4 +1,5 @@
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -308,6 +309,126 @@ class HealTests(unittest.TestCase):
         with patch.object(loadout, "active_spec", return_value=spec):
             self.assertEqual(loadout.heal(force=True), 0)
         kill.assert_called_once_with([blocked])
+
+    @staticmethod
+    def _emacs_node(cid: int, xid: int) -> dict:
+        return {
+            "id": cid, "window": xid, "name": "__loadout__emacs_0__", "pid": None,
+            "marks": [], "window_properties": {"class": "Emacs"},
+            "type": "con", "nodes": [], "floating_nodes": [],
+        }
+
+    @patch.object(loadout.Controller, "launch")
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_claims_existing_emacs_instead_of_relaunching(self, get_tree, windows, claim, launch):
+        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        get_tree.return_value = {
+            "id": 1, "name": "l", "type": "workspace",
+            "nodes": [self._emacs_node(55, 5555)], "floating_nodes": [],
+        }
+        windows.return_value = []
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 0)
+        claim.assert_called_once_with(emacs, 55)
+        launch.assert_not_called()
+
+    @patch.object(loadout, "subprocess")
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_duplicate_unmarked_emacs_is_an_obstacle(self, get_tree, windows, claim, subproc):
+        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
+                                ("loadout:/tmp", "loadout-win:emacs:0"))
+        get_tree.return_value = {
+            "id": 1, "name": "l", "type": "workspace",
+            "nodes": [self._emacs_node(55, 5555), self._emacs_node(556, 5556)],
+            "floating_nodes": [],
+        }
+        orphan = loadout.Window(55, 5555, None, "__loadout__emacs_0__", "l", ())
+        windows.return_value = [marked, orphan]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 1)
+        subproc.Popen.assert_called_once()
+        self.assertEqual(subproc.Popen.call_args[0][0][0], "i3-nagbar")
+        claim.assert_not_called()
+
+
+class EmacsLaunchTests(unittest.TestCase):
+    def _entry(self) -> loadout.Entry:
+        return loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+
+    def _setup(self):
+        get_tree = patch.object(loadout, "get_tree", return_value={}).start()
+        windows = patch.object(loadout, "windows", return_value=[]).start()
+        i3 = patch.object(loadout, "i3").start()
+        self.addCleanup(patch.stopall)
+        return i3
+
+    @staticmethod
+    def _proc_class(records):
+        class FakeProc:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.pid = 999
+                self.terminated = False
+                records.append(self)
+            def terminate(self):
+                self.terminated = True
+            def kill(self):
+                self.terminated = True
+            def wait(self, timeout=None):
+                pass
+        return FakeProc
+
+    def test_no_server_spawns_self_planting_emacs_without_extra_emacsclient(self):
+        i3 = self._setup()
+        spawns = []
+        with patch.object(loadout, "run", return_value=types.SimpleNamespace(returncode=1, stdout="", stderr="")), \
+             patch.object(loadout.subprocess, "Popen", side_effect=self._proc_class(spawns)), \
+             patch.object(loadout, "wait_new", return_value=loadout.Window(1, 100, 999, "t", "l", ())):
+            loadout.Controller(loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (self._entry(),))).launch(self._entry())
+
+        self.assertEqual(len(spawns), 1)
+        self.assertEqual(spawns[0].argv[0], "emacs")
+        self.assertEqual(spawns[0].argv[1], "--eval")
+        expr = spawns[0].argv[2]
+        self.assertIn("(server-start)", expr)
+        self.assertIn("my/lock-workspace-to-dir", expr)
+        self.assertLess(expr.index("my/lock-workspace"), expr.index("set-frame-parameter"))
+        commands = [c.args[0] for c in i3.call_args_list]
+        self.assertTrue(any("loadout-win:emacs:0" in c for c in commands))
+
+    def test_reachable_server_creates_frame_and_plants_via_emacsclient(self):
+        i3 = self._setup()
+        calls = []
+        fake = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        def fake_run(argv, timeout=5.0):
+            calls.append(argv)
+            return fake
+        with patch.object(loadout, "run", side_effect=fake_run), \
+             patch.object(loadout.subprocess, "Popen") as popen, \
+             patch.object(loadout, "wait_new", return_value=loadout.Window(1, 100, None, "t", "l", ())):
+            loadout.Controller(loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (self._entry(),))).launch(self._entry())
+
+        popen.assert_not_called()
+        self.assertTrue(any(a[:2] == ["emacsclient", "-c"] for a in calls))
+        plants = [a for a in calls if a[0] == "emacsclient" and "--eval" in a]
+        self.assertTrue(any("my/lock-workspace-to-dir" in a[2] for a in plants))
+
+    def test_spawn_path_terminates_emacs_when_window_never_appears(self):
+        self._setup()
+        spawns = []
+        run = patch.object(loadout, "run", return_value=types.SimpleNamespace(returncode=1, stdout="", stderr="")).start()
+        popen = patch.object(loadout.subprocess, "Popen", side_effect=self._proc_class(spawns)).start()
+        wait_new = patch.object(loadout, "wait_new", side_effect=loadout.LoadoutError("timeout")).start()
+        with self.assertRaises(loadout.LoadoutError):
+            loadout.Controller(loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (self._entry(),))).launch(self._entry())
+        self.assertTrue(spawns[0].terminated)
 
 
 if __name__ == "__main__":

@@ -23,10 +23,10 @@ Example loadout:
 Run directly as:
 
     python3 loadout.py lock ./loadout
-    python3 loadout.py unlock
+    python3 loadout.py unload
 
-If this file is exposed on PATH as `lock`/`unlock`, it also understands those
-invocation names, so the intended shell UX is simply `lock loadout`.
+If this file is exposed on PATH as `load`/`unload`, it also understands those
+invocation names, so the intended shell UX is simply `load <dir>`.
 """
 
 from __future__ import annotations
@@ -676,7 +676,7 @@ def lock(filename: str) -> int:
     state = active_state()
     if state:
         print(f"A loadout is already locked: {state.get('loadout', '?')}")
-        print("Run `unlock` first.")
+        print("Run `unload` first.")
         return 1
 
     spec = load_spec(filename)
@@ -717,7 +717,7 @@ def lock(filename: str) -> int:
     return 0
 
 
-def unlock() -> int:
+def unload() -> int:
     state = active_state()
     if not state:
         clear_marks()
@@ -737,16 +737,16 @@ def unlock() -> int:
         time.sleep(0.05)
     clear_marks()
     if pid_alive(pid):
-        print("Unlock requested; controller is still shutting down.")
+        print("Unload requested; controller is still shutting down.")
     else:
-        print("Loadout unlocked. Windows were left open.")
+        print("Loadout unloaded. Windows were left open.")
     return 0
 
 
 def status() -> int:
     state = active_state()
     if not state:
-        print("unlocked")
+        print("unloaded")
         return 1
     print(f"{state.get('status', 'active')}: {state.get('loadout', '?')}")
     return 0
@@ -787,7 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="subcommand")
     p_lock = sub.add_parser("lock")
     p_lock.add_argument("file")
-    sub.add_parser("unlock")
+    sub.add_parser("unload")
     sub.add_parser("status")
     p_serve = sub.add_parser("_serve", help=argparse.SUPPRESS)
     p_serve.add_argument("file")
@@ -803,15 +803,15 @@ def main(argv: list[str] | None = None) -> int:
     invoked_as = Path(sys.argv[0]).name
     if invoked_as == "lock":
         argv.insert(0, "lock")
-    elif invoked_as == "unlock":
-        argv.insert(0, "unlock")
+    elif invoked_as == "unload":
+        argv.insert(0, "unload")
 
     args = build_parser().parse_args(argv)
     try:
         if args.subcommand == "lock":
             return lock(args.file)
-        if args.subcommand == "unlock":
-            return unlock()
+        if args.subcommand == "unload":
+            return unload()
         if args.subcommand == "status":
             return status()
         if args.subcommand == "_serve":

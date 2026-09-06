@@ -610,8 +610,10 @@ def heal(force: bool = False) -> int:
     behaves like `load` re-run: every entry must sit, by its `loadout-win:`
     mark, on its own workspace and the emacs on its slot. When everything is
     fulfilled nothing happens; otherwise missing entries are launched and
-    displaced ones moved back, with foreign windows that block a workspace
-    killed only after an i3-nagbar confirmation (`--force` skips the ask).
+    displaced ones moved back. Foreign windows are only a problem on a
+    workspace some entry actually needs to move onto; those are killed only
+    after an i3-nagbar confirmation (`--force` skips the ask), and extra
+    windows sharing an already-healthy slot are never touched.
     Focus is returned to the workspace that was active when heal ran.
 
     Finishes and exits; nothing watches i3 in between.
@@ -650,7 +652,13 @@ def heal(force: bool = False) -> int:
             and emacs_entry.ident not in present and emacs_con_id not in managed):
         managed.add(emacs_con_id)
 
-    obstacles = [w for w in current if w.workspace in spec.slots and w.con_id not in managed]
+    # A workspace only needs evicting when an entry is missing or displaced and
+    # has to move onto it. Extra windows sharing a healthy slot (say a browser
+    # sitting on top of the emacs) block nothing and are the user's own
+    # business — they must not nag on every switch forever.
+    needed = {e.slot for e in spec.entries
+              if e.ident not in present or present[e.ident].workspace != e.slot}
+    obstacles = [w for w in current if w.workspace in needed and w.con_id not in managed]
     if obstacles and not force:
         _ask_blockers(spec, obstacles)
         return 1

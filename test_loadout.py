@@ -339,18 +339,31 @@ class HealTests(unittest.TestCase):
     @patch.object(loadout.Controller, "claim")
     @patch.object(loadout, "windows")
     @patch.object(loadout, "get_tree")
-    def test_duplicate_unmarked_emacs_is_an_obstacle(self, get_tree, windows, claim, subproc):
+    def test_extra_window_on_healthy_emacs_slot_does_not_nag(self, get_tree, windows, claim, subproc):
         emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
         marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
                                 ("loadout:/tmp", "loadout-win:emacs:0"))
-        get_tree.return_value = {
-            "id": 1, "name": "l", "type": "workspace",
-            "nodes": [self._emacs_node(55, 5555), self._emacs_node(556, 5556)],
-            "floating_nodes": [],
-        }
-        orphan = loadout.Window(55, 5555, None, "__loadout__emacs_0__", "l", ())
-        windows.return_value = [marked, orphan]
+        foreign = loadout.Window(55, 5555, None, "browser", "l", ())
+        get_tree.return_value = {}
+        windows.return_value = [marked, foreign]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 0)
+        subproc.Popen.assert_not_called()
+        claim.assert_not_called()
+
+    @patch.object(loadout, "subprocess")
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_foreign_window_blocks_displaced_emacs_slot(self, get_tree, windows, claim, subproc):
+        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", ";",
+                                ("loadout:/tmp", "loadout-win:emacs:0"))
+        foreign = loadout.Window(55, 5555, None, "terminal", "l", ())
+        windows.return_value = [marked, foreign]
+        get_tree.return_value = {}
         with patch.object(loadout, "active_spec", return_value=spec):
             self.assertEqual(loadout.heal(), 1)
         subproc.Popen.assert_called_once()

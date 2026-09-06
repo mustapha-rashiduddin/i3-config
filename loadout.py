@@ -235,6 +235,17 @@ def occupied(spec: Spec, tree: dict[str, Any]) -> list[Window]:
     return [w for w in windows(tree) if w.workspace in spec.slots]
 
 
+def occupied_describe(spec: Spec) -> str:
+    """One line per occupied window slot, for the confirmation prompt."""
+    found = occupied(spec, get_tree())
+    if not found:
+        return ""
+    by_slot: dict[str, list[str]] = {}
+    for win in found:
+        by_slot.setdefault(win.workspace, []).append(win.title or str(win.xid))
+    return "; ".join(f"{slot}: {', '.join(names)}" for slot, names in by_slot.items())
+
+
 def prompt_replace(found: list[Window]) -> bool:
     by_slot: dict[str, list[str]] = {}
     for win in found:
@@ -704,6 +715,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("_serve", help=argparse.SUPPRESS)
     p_serve.add_argument("file")
     p_serve.add_argument("--replace")
+    p_occ = sub.add_parser("_occupied", help=argparse.SUPPRESS)
+    p_occ.add_argument("file")
     return parser
 
 
@@ -725,6 +738,12 @@ def main(argv: list[str] | None = None) -> int:
             return status()
         if args.subcommand == "_serve":
             return serve(args.file, args.replace)
+        if args.subcommand == "_occupied":
+            description = occupied_describe(load_spec(args.file))
+            if description:
+                print(description)
+                return 1
+            return 0
         build_parser().print_help()
         return 2
     except LoadoutError as exc:

@@ -55,6 +55,23 @@ name = "bad"
             with self.assertRaises(loadout.LoadoutError):
                 loadout.load_spec(file)
 
+    def test_terminal_script_is_parsed(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text('''
+[[terminal]]
+slot = "j"
+name = "sql"
+script = "sqlite3"
+
+[[terminal]]
+slot = "k"
+name = "plain"
+''')
+            spec = loadout.load_spec(file)
+            self.assertEqual(spec.entries[0].script, "sqlite3")
+            self.assertIsNone(spec.entries[1].script)
+
 
 class PlanTests(unittest.TestCase):
     spec = None
@@ -570,6 +587,62 @@ class EmacsLaunchTests(unittest.TestCase):
         with self.assertRaises(loadout.LoadoutError):
             loadout.Controller(loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (self._entry(),))).launch(self._entry())
         self.assertTrue(spawns[0].terminated)
+
+
+class TerminalLaunchTests(unittest.TestCase):
+    def _entry(self, ident="terminal:0") -> loadout.Entry:
+        return loadout.Entry(ident, "terminal", "j", "sql", Path("/tmp"),
+                             ("st", "-e", "mksh"), "sql")
+
+    def test_launch_exports_script_env_var(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        envs = []
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.pid = 777
+                envs.append(kwargs.get("env"))
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(loadout, "i3"), \
+             patch.object(loadout, "get_tree", return_value={}), \
+             patch.object(loadout.subprocess, "Popen", side_effect=FakePopen), \
+             patch.object(loadout, "wait_new",
+                          return_value=loadout.Window(1, 100, 777, "t", "j", ())), \
+             patch.object(loadout, "rename_window"):
+            loadout.Controller(spec).launch(self._entry())
+        self.assertEqual(envs[0].get("LOADOUT_SCRIPT"), "sql")
+        self.assertEqual(envs[0].get("LOADOUT_CWD"), str(Path("/tmp")))
+
+    def test_launch_without_script_leaves_env_alone(self):
+        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"),
+                              ("st", "-e", "mksh"), None)
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        envs = []
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.pid = 778
+                envs.append(kwargs.get("env"))
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(loadout, "i3"), \
+             patch.object(loadout, "get_tree", return_value={}), \
+             patch.object(loadout.subprocess, "Popen", side_effect=FakePopen), \
+             patch.object(loadout, "wait_new",
+                          return_value=loadout.Window(1, 100, 778, "t", "j", ())), \
+             patch.object(loadout, "rename_window"):
+            loadout.Controller(spec).launch(entry)
+        self.assertIsNone(envs[0].get("LOADOUT_SCRIPT"))
 
 
 if __name__ == "__main__":

@@ -77,6 +77,7 @@ class Entry:
     name: str
     cwd: Path
     command: tuple[str, ...] = ()
+    script: str | None = None
 
     @property
     def mark(self) -> str:
@@ -218,6 +219,9 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
             raise LoadoutError(f"terminal {n}: path must be a string")
         if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
             raise LoadoutError(f"terminal {n}: command must be a non-empty array of strings")
+        script = item.get("script")
+        if script is not None and not isinstance(script, str):
+            raise LoadoutError(f"terminal {n}: script must be a string")
         entries.append(Entry(
             ident=f"terminal:{n}",
             kind="terminal",
@@ -225,6 +229,7 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
             name=name.strip(),
             cwd=resolve_cwd(root, path),
             command=tuple(command),
+            script=script,
         ))
 
     emacs = data.get("emacs")
@@ -548,10 +553,15 @@ class Controller:
 
         if entry.kind == "terminal":
             command = terminal_command(entry, title)
+            env = dict(os.environ)
+            if entry.script:
+                env["LOADOUT_SCRIPT"] = entry.script
+                env["LOADOUT_CWD"] = str(entry.cwd)
             try:
                 proc = subprocess.Popen(
                     command,
                     cwd=entry.cwd,
+                    env=env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

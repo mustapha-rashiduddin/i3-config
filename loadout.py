@@ -426,6 +426,85 @@ def stop_process(proc: subprocess.Popen[bytes]) -> None:
             pass
 
 
+SHELL_PROGS = {"mksh", "zsh", "bash", "fish", "sh", "dash", "ksh", "ash"}
+
+
+def _proc_children(pid: int) -> list[int]:
+    try:
+        raw = Path(f"/proc/{pid}/task/{pid}/children").read_text()
+    except OSError:
+        return []
+    return [int(p) for p in raw.split() if p.isdigit()]
+
+
+def _proc_comm(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _net_wm_pid(xid: int | None) -> int | None:
+    """i3's tree carries no pid for st/emacs; ask X for _NET_WM_PID."""
+    if xid is None:
+        return None
+    try:
+        result = run(["xprop", "-id", hex(xid), "_NET_WM_PID"], timeout=1.0)
+    except LoadoutError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.rsplit(None, 1)[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def terminal_cwd(win: Window) -> Path | None:
+    """The shell's working directory of a managed terminal window.
+
+    The X client (st) spawns the shell as its only child, so the shell is that
+    one child iff it is a known shell program; otherwise (st running a program
+    directly, or the process already gone) there is nothing to inspect.
+    """
+    pid = win.pid or _net_wm_pid(win.xid)
+    if pid is None:
+        return None
+    children = _proc_children(pid)
+    if not children:
+        return None
+    shell = children[0]
+    if _proc_comm(shell) not in SHELL_PROGS:
+        return None
+    try:
+        return Path(os.readlink(f"/proc/{shell}/cwd"))
+    except OSError:
+        return None
+
+
+def emacs_plant_matches(path: Path) -> bool:
+    """Ask the Emacs server whether it is planted on `path`."""
+    expr = (
+        "(and (boundp 'my/current-workspace-root) "
+        f"(string= (directory-file-name my/current-workspace-root) "
+        f"{elisp_string(str(path))}))"
+    )
+    try:
+        result = run(["emacsclient", "--eval", expr], timeout=3.0)
+    except LoadoutError:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "t"
+
+
+def restore_emacs_plant(path: Path) -> bool:
+    """Plant the Emacs server on `path` via the loadout entry function."""
+    try:
+        result = run(["emacsclient", "--eval", emacs_plant(path)], timeout=5.0)
+    except LoadoutError:
+        return False
+    return result.returncode == 0
+
+
 class Controller:
     """One-shot materializer: adopt existing windows and launch missing ones.
 
@@ -685,6 +764,32 @@ def heal(force: bool = False) -> int:
             controller.launch(entry)
         elif win.workspace != entry.slot:
             controller.claim(entry, win.con_id)
+
+    # Internal placement self-healing. Every window now sits on its slot, but
+    # a reused terminal may have been cd'd away from its loadout directory
+    # and an adopted emacs may be planted on a different directory. Per the
+    # shift contract a drifted terminal is restarted in place; a misplanted
+    # emacs is replanted via its own entry function. Best-effort: never
+    # blocks a switch, never asks. A terminal whose state cannot be inspected
+    # (no pid, or st running a program rather than a shell) is left alone.
+    for entry in spec.entries:
+        if entry.kind != "terminal":
+            continue
+        win = present.get(entry.ident)
+        if win is None:
+            continue
+        cwd = terminal_cwd(win)
+        if cwd is not None and os.path.realpath(cwd) != os.path.realpath(entry.cwd):
+            kill_windows([win])
+            controller.launch(entry)
+            print(f"  terminal {entry.ident}: restarted at {entry.cwd}")
+
+    if emacs_entry is not None:
+        win = present.get(emacs_entry.ident)
+        if win is not None or emacs_con_id is not None:
+            if not emacs_plant_matches(emacs_entry.cwd):
+                if restore_emacs_plant(emacs_entry.cwd):
+                    print(f"  emacs {emacs_entry.ident}: plant -> {emacs_entry.cwd}")
 
     if stayed:
         i3(f"workspace {quote(stayed)}")

@@ -249,8 +249,9 @@ class HealTests(unittest.TestCase):
     @patch.object(loadout.Controller, "launch")
     @patch.object(loadout.Controller, "claim")
     @patch.object(loadout, "windows")
+    @patch.object(loadout, "terminal_cwd", return_value=Path("/tmp"))
     @patch.object(loadout, "get_tree")
-    def test_heal_keeps_present_marked_terminals(self, get_tree, windows, claim, launch):
+    def test_heal_keeps_present_marked_terminals(self, get_tree, tm_cwd, windows, claim, launch):
         entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
         get_tree.return_value = {}
@@ -264,8 +265,9 @@ class HealTests(unittest.TestCase):
     @patch.object(loadout.Controller, "launch")
     @patch.object(loadout.Controller, "claim")
     @patch.object(loadout, "windows")
+    @patch.object(loadout, "terminal_cwd", return_value=Path("/tmp"))
     @patch.object(loadout, "get_tree")
-    def test_heal_moves_displaced_marked_terminal_back(self, get_tree, windows, claim, launch):
+    def test_heal_moves_displaced_marked_terminal_back(self, get_tree, tm_cwd, windows, claim, launch):
         entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
         get_tree.return_value = {}
@@ -321,8 +323,9 @@ class HealTests(unittest.TestCase):
     @patch.object(loadout.Controller, "launch")
     @patch.object(loadout.Controller, "claim")
     @patch.object(loadout, "windows")
+    @patch.object(loadout, "emacs_plant_matches", return_value=True)
     @patch.object(loadout, "get_tree")
-    def test_heal_claims_existing_emacs_instead_of_relaunching(self, get_tree, windows, claim, launch):
+    def test_heal_claims_existing_emacs_instead_of_relaunching(self, get_tree, matches, windows, claim, launch):
         emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
         get_tree.return_value = {
@@ -338,8 +341,9 @@ class HealTests(unittest.TestCase):
     @patch.object(loadout, "subprocess")
     @patch.object(loadout.Controller, "claim")
     @patch.object(loadout, "windows")
+    @patch.object(loadout, "emacs_plant_matches", return_value=True)
     @patch.object(loadout, "get_tree")
-    def test_extra_window_on_healthy_emacs_slot_does_not_nag(self, get_tree, windows, claim, subproc):
+    def test_extra_window_on_healthy_emacs_slot_does_not_nag(self, get_tree, matches, windows, claim, subproc):
         emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
         marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
@@ -369,6 +373,93 @@ class HealTests(unittest.TestCase):
         subproc.Popen.assert_called_once()
         self.assertEqual(subproc.Popen.call_args[0][0][0], "i3-nagbar")
         claim.assert_not_called()
+
+    @patch.object(loadout, "emacs_plant_matches", return_value=True)
+    @patch.object(loadout.Controller, "launch")
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "terminal_cwd", return_value=Path("/elsewhere"))
+    @patch.object(loadout, "kill_windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_restarts_terminal_on_cwd_drift(self, get_tree, kill, tm_cwd, windows, claim, launch, matches):
+        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        get_tree.return_value = {}
+        win = loadout.Window(1, 100, None, "x", "j", ("loadout:/tmp", "loadout-win:terminal:0"))
+        windows.return_value = [win]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 0)
+        kill.assert_called_once_with([win])
+        launch.assert_called_once_with(entry)
+        claim.assert_not_called()
+
+    @patch.object(loadout, "emacs_plant_matches", return_value=True)
+    @patch.object(loadout.Controller, "launch")
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "terminal_cwd", return_value=None)
+    @patch.object(loadout, "kill_windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_leaves_uninspectable_terminal_alone(self, get_tree, kill, tm_cwd, windows, claim, launch, matches):
+        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        get_tree.return_value = {}
+        win = loadout.Window(1, 100, None, "x", "j", ("loadout:/tmp", "loadout-win:terminal:0"))
+        windows.return_value = [win]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 0)
+        kill.assert_not_called()
+        launch.assert_not_called()
+
+    @patch.object(loadout, "restore_emacs_plant")
+    @patch.object(loadout, "emacs_plant_matches", return_value=False)
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_replants_misplanted_emacs(self, get_tree, windows, claim, matches, restore):
+        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
+                                ("loadout:/tmp", "loadout-win:emacs:0"))
+        get_tree.return_value = {}
+        windows.return_value = [marked]
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 0)
+        matches.assert_called_once_with(Path("/tmp"))
+        restore.assert_called_once_with(Path("/tmp"))
+
+    @patch.object(loadout, "restore_emacs_plant")
+    @patch.object(loadout, "emacs_plant_matches", return_value=True)
+    @patch.object(loadout.Controller, "claim")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_checks_plant_for_claimed_emacs(self, get_tree, windows, claim, matches, restore):
+        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        get_tree.return_value = {
+            "id": 1, "name": "l", "type": "workspace",
+            "nodes": [self._emacs_node(55, 5555)], "floating_nodes": [],
+        }
+        windows.return_value = []
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 0)
+        claim.assert_called_once_with(emacs, 55)
+        matches.assert_called_once_with(Path("/tmp"))
+        restore.assert_not_called()
+
+    @patch.object(loadout, "emacs_plant_matches")
+    @patch.object(loadout.Controller, "launch")
+    @patch.object(loadout, "windows")
+    @patch.object(loadout, "get_tree")
+    def test_heal_skips_emacs_plant_check_after_fresh_launch(self, get_tree, windows, launch, matches):
+        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        get_tree.return_value = {}
+        windows.return_value = []
+        with patch.object(loadout, "active_spec", return_value=spec):
+            self.assertEqual(loadout.heal(), 0)
+        launch.assert_called_once_with(emacs)
+        matches.assert_not_called()
 
 
 class EmacsLaunchTests(unittest.TestCase):

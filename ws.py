@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from datetime import datetime
 from select import select
 
@@ -22,13 +23,13 @@ _name_overlay = {}
 _overlay_mtime = 0.0
 
 ROW_KEYS = ["j", "k", "l", ";", "m", ",", ".", "/"]
-GREEN = set(ROW_KEYS[:4])
+LOADOUT_MARK = "loadout:"
 
 CHAR_W = 12
 PAD_W = 11
 ELL = "\u2026"
 
-BOX_WIDTH = 133
+BOX_WIDTH = 132
 
 _snapshot = {
     "workspaces": [],
@@ -220,6 +221,53 @@ def walk_workspaces(node):
     return found
 
 
+def _walk_nodes(node):
+    yield node
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        yield from _walk_nodes(child)
+
+
+def _parse_loadout_slots(path):
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return set()
+    slots = set()
+    for item in data.get("terminal") or []:
+        slot = item.get("slot") if isinstance(item, dict) else None
+        if slot:
+            slots.add(slot)
+    emacs = data.get("emacs")
+    if isinstance(emacs, dict) and emacs.get("slot"):
+        slots.add(emacs["slot"])
+    return slots
+
+
+def loadout_keys(tree):
+    """Workspace keys used by the engaged loadout(s), green in the bar.
+
+    The engaged loadout root lives in i3's RAM as the `loadout:<root>` marks
+    carried by its windows; everything is red unless such a loadout exists.
+    """
+    roots = set()
+    if tree:
+        for node in _walk_nodes(tree):
+            for m in node.get("marks") or []:
+                if m.startswith(LOADOUT_MARK):
+                    root = m[len(LOADOUT_MARK):]
+                    if root:
+                        roots.add(root)
+    keys = set()
+    for root in sorted(roots):
+        for name in ("loadout", "loadout.toml"):
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                keys |= _parse_loadout_slots(path)
+                break
+    return keys
+
+
 def vol_block():
     v = run(["pamixer", "--get-volume"])
     muted = run(["pamixer", "--get-mute"]) == "true"
@@ -296,7 +344,7 @@ def _rebuild_apps():
             if a not in apps_list:
                 apps_list.append(a)
         apps[name] = apps_list
-    _snapshot = {**_snapshot, "apps": apps}
+    _snapshot = {**_snapshot, "apps": apps, "loadout_keys": loadout_keys(_cached_tree)}
     _overlay_gen += 1
 
 
@@ -334,6 +382,7 @@ def _refresh():
     _snapshot = {
         "workspaces": workspaces,
         "apps": apps,
+        "loadout_keys": loadout_keys(tree),
         "sw": sw,
         "status": status_texts,
         "screen_w": screen_w,
@@ -379,6 +428,7 @@ def render(row_keys):
     apps = snap["apps"]
     sw = snap["sw"]
     screen_w = snap["screen_w"]
+    loadout_keys = snap.get("loadout_keys") or set()
     width = BOX_WIDTH
     blocks = []
     for key in row_keys:
@@ -386,17 +436,18 @@ def render(row_keys):
         app_list = apps.get(key, [])
         label = f"{key}:{','.join(app_list)}" if app_list else key
         text = " " + truncate(label, width) + " "
+        green = key in loadout_keys
         if ws:
             if ws.get("focused"):
-                bg, fg = ("#009900", "#ffffff") if key in GREEN else ("#990000", "#ffffff")
+                bg, fg = ("#009900", "#ffffff") if green else ("#990000", "#ffffff")
             elif ws.get("urgent"):
                 bg, fg = "#7a1010", "#ffffff"
             else:
-                bg, fg = ("#2e2e2e", "#00ff00" if key in GREEN else "#ff5252")
+                bg, fg = ("#2e2e2e", "#00ff00" if green else "#ff5252")
         elif _last_focused == key:
-            bg, fg = ("#009900", "#ffffff") if key in GREEN else ("#990000", "#ffffff")
+            bg, fg = ("#009900", "#ffffff") if green else ("#990000", "#ffffff")
         else:
-            bg, fg = ("#1c1c1c", "#00ff00" if key in GREEN else "#ff5252")
+            bg, fg = ("#1c1c1c", "#00ff00" if green else "#ff5252")
         blocks.append({
             "full_text": text,
             "name": f"ws.{key}",

@@ -244,276 +244,169 @@ slot = "l"
 
 
 class HealTests(unittest.TestCase):
+    def _entry(self, ident="terminal:0", kind="terminal", slot="j", name="sql", cwd=None):
+        if kind == "emacs":
+            return loadout.Entry(ident, kind, slot, name, cwd or Path("/tmp"))
+        return loadout.Entry(ident, kind, slot, name, cwd or Path("/tmp"), ("st", "-e", "mksh"))
+
+    def _win(self, cid, xid, ws, marks):
+        return loadout.Window(cid, xid, None, "t", ws, tuple(marks))
+
+    def _engage(self, spec, *wins):
+        get_tree = patch.object(loadout, "get_tree", return_value={}).start()
+        windows = patch.object(loadout, "windows", return_value=list(wins)).start()
+        active = patch.object(loadout, "active_spec", return_value=spec).start()
+        self.addCleanup(patch.stopall)
+
     def test_noop_when_not_engaged(self):
-        with patch.object(loadout, "active_spec", return_value=None):
+        patch.object(loadout, "get_tree", return_value={}).start()
+        patch.object(loadout, "windows", return_value=[]).start()
+        unload = patch.object(loadout, "unload").start()
+        self.addCleanup(patch.stopall)
+        self.assertEqual(loadout.heal(), 0)
+        unload.assert_not_called()
+
+    def test_unreadable_spec_unloads(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        patch.object(loadout, "get_tree", return_value={}).start()
+        patch.object(loadout, "windows", return_value=[self._win(1, 100, "j", ("loadout:/tmp",))]).start()
+        patch.object(loadout, "active_spec", return_value=None).start()
+        unload = patch.object(loadout, "unload").start()
+        self.addCleanup(patch.stopall)
+        self.assertEqual(loadout.heal(), 1)
+        unload.assert_called_once_with()
+
+    def test_healthy_loadout_stays_green(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        win = self._win(1, 100, "j", ("loadout:/tmp", "loadout-win:terminal:0"))
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "read_overlay", return_value={"100": "sql"}), \
+             patch.object(loadout, "terminal_cwd", return_value=Path("/tmp")):
+            self._engage(spec, win)
             self.assertEqual(loadout.heal(), 0)
+        unload.assert_not_called()
 
-    @patch.object(loadout.Controller, "launch")
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "get_tree")
-    def test_force_relaunches_missing_entries(self, get_tree, windows, claim, launch):
-        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
-        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
-        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry, emacs))
-        get_tree.return_value = {}
-        windows.return_value = []
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(force=True), 0)
-        launch.assert_any_call(entry)
-        launch.assert_any_call(emacs)
-
-    @patch.object(loadout.Controller, "launch")
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "terminal_cwd", return_value=Path("/tmp"))
-    @patch.object(loadout, "get_tree")
-    def test_heal_keeps_present_marked_terminals(self, get_tree, tm_cwd, windows, claim, launch):
-        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
+    def test_missing_window_unloads(self):
+        entry = self._entry()
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
-        get_tree.return_value = {}
-        win = loadout.Window(1, 100, None, "x", "j", ("loadout:/tmp", "loadout-win:terminal:0"))
-        windows.return_value = [win]
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(force=True), 0)
-        launch.assert_not_called()
-        claim.assert_not_called()
-
-    @patch.object(loadout.Controller, "launch")
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "terminal_cwd", return_value=Path("/tmp"))
-    @patch.object(loadout, "get_tree")
-    def test_heal_moves_displaced_marked_terminal_back(self, get_tree, tm_cwd, windows, claim, launch):
-        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
-        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
-        get_tree.return_value = {}
-        win = loadout.Window(1, 100, None, "x", "k", ("loadout:/tmp", "loadout-win:terminal:0"))
-        windows.return_value = [win]
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(force=True), 0)
-        launch.assert_not_called()
-        claim.assert_called_once_with(entry, win.con_id)
-
-    @patch.object(loadout, "subprocess")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "get_tree")
-    def test_obstacles_ask_via_nagbar(self, get_tree, windows, subproc):
-        spec = loadout.Spec(
-            Path("/tmp/loadout"), Path("/tmp"),
-            (loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",)),),
-        )
-        blocked = loadout.Window(1, 100, None, "firefox", "j", ())
-        get_tree.return_value = {}
-        windows.return_value = [blocked]
-        with patch.object(loadout, "active_spec", return_value=spec):
+        beacon = self._win(2, 200, "m", ("loadout:/tmp",))
+        with patch.object(loadout, "unload") as unload:
+            self._engage(spec, beacon)
             self.assertEqual(loadout.heal(), 1)
-        subproc.Popen.assert_called_once()
-        argv = subproc.Popen.call_args[0][0]
-        self.assertEqual(argv[0], "i3-nagbar")
-        self.assertTrue(any("heal --force" in arg for arg in argv))
+        unload.assert_called_once_with()
 
-    @patch.object(loadout.Controller, "launch")
-    @patch.object(loadout, "kill_windows")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "get_tree")
-    def test_force_kills_obstacles(self, get_tree, windows, kill, launch):
-        spec = loadout.Spec(
-            Path("/tmp/loadout"), Path("/tmp"),
-            (loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",)),),
-        )
-        blocked = loadout.Window(1, 100, None, "firefox", "j", ())
-        get_tree.return_value = {}
-        windows.return_value = [blocked]
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(force=True), 0)
-        kill.assert_called_once_with([blocked])
-
-    @staticmethod
-    def _emacs_node(cid: int, xid: int) -> dict:
-        return {
-            "id": cid, "window": xid, "name": "__loadout__emacs_0__", "pid": None,
-            "marks": [], "window_properties": {"class": "Emacs"},
-            "type": "con", "nodes": [], "floating_nodes": [],
-        }
-
-    @patch.object(loadout.Controller, "launch")
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "emacs_plant_matches", return_value=True)
-    @patch.object(loadout, "get_tree")
-    def test_heal_claims_existing_emacs_instead_of_relaunching(self, get_tree, matches, windows, claim, launch):
-        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
-        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
-        get_tree.return_value = {
-            "id": 1, "name": "l", "type": "workspace",
-            "nodes": [self._emacs_node(55, 5555)], "floating_nodes": [],
-        }
-        windows.return_value = []
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(), 0)
-        claim.assert_called_once_with(emacs, 55)
-        launch.assert_not_called()
-
-    @patch.object(loadout, "subprocess")
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "emacs_plant_matches", return_value=True)
-    @patch.object(loadout, "planted_db_root", return_value=None)
-    @patch.object(loadout, "get_tree")
-    def test_extra_window_on_healthy_emacs_slot_does_not_nag(self, get_tree, db, matches, windows, claim, subproc):
-        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
-        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
-        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
-                                ("loadout:/tmp", "loadout-win:emacs:0"))
-        foreign = loadout.Window(55, 5555, None, "browser", "l", ())
-        get_tree.return_value = {}
-        windows.return_value = [marked, foreign]
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(), 0)
-        subproc.Popen.assert_not_called()
-        claim.assert_not_called()
-
-    @patch.object(loadout, "subprocess")
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "get_tree")
-    def test_foreign_window_blocks_displaced_emacs_slot(self, get_tree, windows, claim, subproc):
-        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
-        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
-        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", ";",
-                                ("loadout:/tmp", "loadout-win:emacs:0"))
-        foreign = loadout.Window(55, 5555, None, "terminal", "l", ())
-        windows.return_value = [marked, foreign]
-        get_tree.return_value = {}
-        with patch.object(loadout, "active_spec", return_value=spec):
+    def test_wrong_workspace_unloads(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        win = self._win(1, 100, "k", ("loadout:/tmp", "loadout-win:terminal:0"))
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "read_overlay", return_value={"100": "sql"}), \
+             patch.object(loadout, "terminal_cwd", return_value=Path("/tmp")):
+            self._engage(spec, win)
             self.assertEqual(loadout.heal(), 1)
-        subproc.Popen.assert_called_once()
-        self.assertEqual(subproc.Popen.call_args[0][0][0], "i3-nagbar")
-        claim.assert_not_called()
+        unload.assert_called_once_with()
 
-    @patch.object(loadout, "emacs_plant_matches", return_value=True)
-    @patch.object(loadout.Controller, "launch")
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "terminal_cwd", return_value=Path("/elsewhere"))
-    @patch.object(loadout, "kill_windows")
-    @patch.object(loadout, "get_tree")
-    def test_heal_restarts_terminal_on_cwd_drift(self, get_tree, kill, tm_cwd, windows, claim, launch, matches):
-        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
+    def test_wrong_name_unloads(self):
+        entry = self._entry()
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
-        get_tree.return_value = {}
-        win = loadout.Window(1, 100, None, "x", "j", ("loadout:/tmp", "loadout-win:terminal:0"))
-        windows.return_value = [win]
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(), 0)
-        kill.assert_called_once_with([win])
-        launch.assert_called_once_with(entry)
-        claim.assert_not_called()
+        win = self._win(1, 100, "j", ("loadout:/tmp", "loadout-win:terminal:0"))
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "read_overlay", return_value={"100": "server"}), \
+             patch.object(loadout, "terminal_cwd", return_value=Path("/tmp")):
+            self._engage(spec, win)
+            self.assertEqual(loadout.heal(), 1)
+        unload.assert_called_once_with()
 
-    @patch.object(loadout, "emacs_plant_matches", return_value=True)
-    @patch.object(loadout.Controller, "launch")
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "terminal_cwd", return_value=None)
-    @patch.object(loadout, "kill_windows")
-    @patch.object(loadout, "get_tree")
-    def test_heal_leaves_uninspectable_terminal_alone(self, get_tree, kill, tm_cwd, windows, claim, launch, matches):
-        entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"), ("st",))
+    def test_missing_overlay_name_unloads(self):
+        entry = self._entry()
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
-        get_tree.return_value = {}
-        win = loadout.Window(1, 100, None, "x", "j", ("loadout:/tmp", "loadout-win:terminal:0"))
-        windows.return_value = [win]
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(), 0)
-        kill.assert_not_called()
-        launch.assert_not_called()
+        win = self._win(1, 100, "j", ("loadout:/tmp", "loadout-win:terminal:0"))
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "read_overlay", return_value={}), \
+             patch.object(loadout, "terminal_cwd", return_value=Path("/tmp")):
+            self._engage(spec, win)
+            self.assertEqual(loadout.heal(), 1)
+        unload.assert_called_once_with()
 
-    @patch.object(loadout, "restore_emacs_plant")
-    @patch.object(loadout, "emacs_plant_matches", return_value=False)
-    @patch.object(loadout, "planted_db_root", return_value=None)
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "get_tree")
-    def test_heal_replants_misplanted_emacs(self, get_tree, windows, claim, db, matches, restore):
-        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
-        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
-        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
-                                ("loadout:/tmp", "loadout-win:emacs:0"))
-        get_tree.return_value = {}
-        windows.return_value = [marked]
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(), 0)
-        matches.assert_called_once_with(Path("/tmp"))
-        restore.assert_called_once_with(Path("/tmp"))
+    def test_cwd_drift_unloads(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        win = self._win(1, 100, "j", ("loadout:/tmp", "loadout-win:terminal:0"))
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "read_overlay", return_value={"100": "sql"}), \
+             patch.object(loadout, "terminal_cwd", return_value=Path("/elsewhere")):
+            self._engage(spec, win)
+            self.assertEqual(loadout.heal(), 1)
+        unload.assert_called_once_with()
 
-    @patch.object(loadout, "restore_emacs_plant")
-    @patch.object(loadout, "emacs_plant_matches", return_value=True)
-    @patch.object(loadout, "planted_db_root", return_value=Path("/elsewhere"))
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "get_tree")
-    def test_heal_replants_db_when_plant_drifted(self, get_tree, windows, claim, db, matches, restore):
-        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
-        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
-        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
-                                ("loadout:/tmp", "loadout-win:emacs:0"))
-        get_tree.return_value = {}
-        windows.return_value = [marked]
-        with patch.object(loadout, "active_spec", return_value=spec):
+    def test_uninspectable_cwd_is_healthy(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        win = self._win(1, 100, "j", ("loadout:/tmp", "loadout-win:terminal:0"))
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "read_overlay", return_value={"100": "sql"}), \
+             patch.object(loadout, "terminal_cwd", return_value=None):
+            self._engage(spec, win)
             self.assertEqual(loadout.heal(), 0)
-        restore.assert_called_once_with(Path("/tmp"))
+        unload.assert_not_called()
 
-    @patch.object(loadout, "restore_emacs_plant")
-    @patch.object(loadout, "emacs_plant_matches", return_value=True)
-    @patch.object(loadout, "planted_db_root", return_value=Path("/tmp"))
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "get_tree")
-    def test_heal_does_not_replant_when_everything_matches(self, get_tree, windows, claim, db, matches, restore):
-        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+    def test_healthy_emacs_stays_green(self):
+        emacs = self._entry("emacs:0", "emacs", "l", "emacs")
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
-        marked = loadout.Window(556, 5556, None, "__loadout__emacs_0__", "l",
-                                ("loadout:/tmp", "loadout-win:emacs:0"))
-        get_tree.return_value = {}
-        windows.return_value = [marked]
-        with patch.object(loadout, "active_spec", return_value=spec):
+        win = self._win(556, 5556, "l", ("loadout:/tmp", "loadout-win:emacs:0"))
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "emacs_plant_matches", return_value=True), \
+             patch.object(loadout, "planted_db_root", return_value=Path("/tmp")):
+            self._engage(spec, win)
             self.assertEqual(loadout.heal(), 0)
-        restore.assert_not_called()
+        unload.assert_not_called()
 
-    @patch.object(loadout, "restore_emacs_plant")
-    @patch.object(loadout, "emacs_plant_matches", return_value=True)
-    @patch.object(loadout, "planted_db_root", return_value=None)
-    @patch.object(loadout.Controller, "claim")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "get_tree")
-    def test_heal_checks_plant_for_claimed_emacs(self, get_tree, windows, claim, db, matches, restore):
-        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+    def test_emacs_misplant_unloads(self):
+        emacs = self._entry("emacs:0", "emacs", "l", "emacs")
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
-        get_tree.return_value = {
-            "id": 1, "name": "l", "type": "workspace",
-            "nodes": [self._emacs_node(55, 5555)], "floating_nodes": [],
-        }
-        windows.return_value = []
-        with patch.object(loadout, "active_spec", return_value=spec):
-            self.assertEqual(loadout.heal(), 0)
-        claim.assert_called_once_with(emacs, 55)
-        matches.assert_called_once_with(Path("/tmp"))
-        restore.assert_not_called()
+        win = self._win(556, 5556, "l", ("loadout:/tmp", "loadout-win:emacs:0"))
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "emacs_plant_matches", return_value=False), \
+             patch.object(loadout, "planted_db_root", return_value=None):
+            self._engage(spec, win)
+            self.assertEqual(loadout.heal(), 1)
+        unload.assert_called_once_with()
 
-    @patch.object(loadout, "emacs_plant_matches")
-    @patch.object(loadout.Controller, "launch")
-    @patch.object(loadout, "windows")
-    @patch.object(loadout, "get_tree")
-    def test_heal_skips_emacs_plant_check_after_fresh_launch(self, get_tree, windows, launch, matches):
-        emacs = loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
+    def test_emacs_db_drift_unloads(self):
+        emacs = self._entry("emacs:0", "emacs", "l", "emacs")
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
-        get_tree.return_value = {}
-        windows.return_value = []
-        with patch.object(loadout, "active_spec", return_value=spec):
+        win = self._win(556, 5556, "l", ("loadout:/tmp", "loadout-win:emacs:0"))
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "emacs_plant_matches", return_value=True), \
+             patch.object(loadout, "planted_db_root", return_value=Path("/elsewhere")):
+            self._engage(spec, win)
+            self.assertEqual(loadout.heal(), 1)
+        unload.assert_called_once_with()
+
+    def test_extra_window_on_healthy_slot_does_not_unload(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        win = self._win(1, 100, "j", ("loadout:/tmp", "loadout-win:terminal:0"))
+        foreign = self._win(2, 200, "j", ())
+        with patch.object(loadout, "unload") as unload, \
+             patch.object(loadout, "read_overlay", return_value={"100": "sql"}), \
+             patch.object(loadout, "terminal_cwd", return_value=Path("/tmp")):
+            self._engage(spec, win, foreign)
             self.assertEqual(loadout.heal(), 0)
-        launch.assert_called_once_with(emacs)
-        matches.assert_not_called()
+        unload.assert_not_called()
+
+    def test_first_discrepancy_stops_the_sweep(self):
+        first = self._entry("terminal:0", "terminal", "j", "sql")
+        second = self._entry("terminal:1", "terminal", "k", "server")
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (first, second))
+        win0 = self._win(1, 100, "k", ("loadout:/tmp", "loadout-win:terminal:0"))
+        win1 = self._win(3, 300, "k", ("loadout:/tmp", "loadout-win:terminal:1"))
+        with patch.object(loadout, "unload") as unload:
+            self._engage(spec, win0, win1)
+            self.assertEqual(loadout.heal(), 1)
+        unload.assert_called_once_with()
 
 
 class EmacsLaunchTests(unittest.TestCase):

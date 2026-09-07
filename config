@@ -62,7 +62,7 @@ set $ws8 "/"
 #set $ws15 "c"
 #set $ws16 "v"
 
-# switch to workspace (the loadout slots; heal the engaged loadout on arrival)
+# switch to workspace (the loadout slots; sweep the loadout and unload on any drift)
 bindsym $mod+j workspace $ws1; exec --no-startup-id ~/.config/i3/loadout.py heal
 bindsym $mod+k workspace $ws2; exec --no-startup-id ~/.config/i3/loadout.py heal
 bindsym $mod+l workspace $ws3; exec --no-startup-id ~/.config/i3/loadout.py heal

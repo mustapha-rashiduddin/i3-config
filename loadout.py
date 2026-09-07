@@ -36,9 +36,10 @@ closed. `unload` simply clears the loadout marks.
 `heal` is triggered by the i3 keybindings that switch to a loadout workspace.
 It finds the engaged loadout via the `loadout:<root>` marks left on the windows
 (the root is kept in i3's RAM, never written to a file), re-reads the TOML, and
-repairs the layout on demand: each entry is located by its unique
-`loadout-win:<ident>` mark, moved back to its slot or relaunched if its window
-is gone, asking before killing anything that blocks a workspace.
+sweeps every entry: the managed window (its `loadout-win:<ident>` mark) must
+exist, sit on its slot, show its assigned name, and be anchored on its loadout
+directory. There is no repair — the first discrepancy unloads the loadout so
+every workspace button turns red; reload explicitly afterwards.
 """
 
 from __future__ import annotations
@@ -524,15 +525,6 @@ def planted_db_root() -> Path | None:
     return Path(rows[0]) if rows else None
 
 
-def restore_emacs_plant(path: Path) -> bool:
-    """Plant the Emacs server on `path` via the loadout entry function."""
-    try:
-        result = run(["emacsclient", "--eval", emacs_plant(path)], timeout=5.0)
-    except LoadoutError:
-        return False
-    return result.returncode == 0
-
-
 class Controller:
     """One-shot materializer: adopt existing windows and launch missing ones.
 
@@ -692,146 +684,85 @@ def status() -> int:
     return 1
 
 
-def _ask_blockers(spec: Spec, obstacles: list[Window]) -> None:
-    """Ask, via i3-nagbar, whether to kill the windows blocking the loadout.
+def read_overlay() -> dict[str, str]:
+    """The ws.py window-name overlay: {xid or con_id: displayed label}."""
+    try:
+        data = json.loads(OVERLAY.read_text())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    `heal` runs from an i3 keybinding (exec), so there is no terminal to read an
-    answer from; the nagbar buttons re-run heal with `--force` (kill) or do
-    nothing.
+
+def sweep_discrepancy(spec: Spec, present: dict[str, Window]) -> str | None:
+    """First discrepancy found sweeping each of spec's entries, else None.
+
+    An entry is healthy when its managed window exists, sits on its own slot,
+    shows its assigned name (terminals only; emacs is never renamed) and is
+    anchored on its loadout directory — the terminal shell's cwd, or the
+    emacs plant and the speed-dial database. A terminal whose cwd cannot be
+    inspected is assumed fine. The sweep reports the first failing entry and
+    stops; `heal` unloads on exactly that signal.
     """
-    by_slot: dict[str, list[str]] = {}
-    for win in obstacles:
-        by_slot.setdefault(win.workspace, []).append(win.title or str(win.xid))
-    slots = "; ".join(f"{s}: {', '.join(names)}" for s, names in sorted(by_slot.items()))
-    command = " ".join([
-        "i3-msg", "exec", "--no-startup-id",
-        f"{sys.executable} {Path(__file__).absolute()} heal --force",
-    ])
-    subprocess.Popen([
-        "i3-nagbar", "-t", "warning",
-        "-m", f"Loadout workspace(s) occupied ({slots}). Kill and restore?",
-        "-B", "Kill & heal", command,
-        "-B", "Leave it", "true",
-    ])
+    overlay = read_overlay()
+    for entry in spec.entries:
+        win = present.get(entry.ident)
+        if win is None:
+            return f"{entry.kind} {entry.ident}: window missing"
+        if win.workspace != entry.slot:
+            return (
+                f"{entry.kind} {entry.ident}: on workspace {win.workspace}, "
+                f"expected {entry.slot}"
+            )
+        if entry.kind == "terminal":
+            shown = overlay.get(str(win.con_id))
+            if win.xid is not None:
+                shown = overlay.get(str(win.xid)) or shown
+            if shown != entry.name:
+                return f"terminal {entry.ident}: label {shown!r}, expected {entry.name!r}"
+            cwd = terminal_cwd(win)
+            if cwd is not None and os.path.realpath(cwd) != os.path.realpath(entry.cwd):
+                return f"terminal {entry.ident}: cwd {cwd}, expected {entry.cwd}"
+        elif not emacs_plant_matches(entry.cwd):
+            return f"emacs {entry.ident}: planted elsewhere"
+        else:
+            db = planted_db_root()
+            if db is not None and os.path.realpath(db) != os.path.realpath(entry.cwd):
+                return f"emacs {entry.ident}: speed-dial planted {db}, expected {entry.cwd}"
+    return None
 
 
-def heal(force: bool = False) -> int:
-    """Verify and repair the engaged loadout; runs on a loadout-workspace switch.
+def heal() -> int:
+    """Sweep the engaged loadout and unload on the first discrepancy.
 
-    If no loadout is engaged (no `loadout:` marks) this is a no-op. Otherwise it
-    behaves like `load` re-run: every entry must sit, by its `loadout-win:`
-    mark, on its own workspace and the emacs on its slot. When everything is
-    fulfilled nothing happens; otherwise missing entries are launched and
-    displaced ones moved back. Foreign windows are only a problem on a
-    workspace some entry actually needs to move onto; those are killed only
-    after an i3-nagbar confirmation (`--force` skips the ask), and extra
-    windows sharing an already-healthy slot are never touched.
-    Focus is returned to the workspace that was active when heal ran.
-
-    Finishes and exits; nothing watches i3 in between.
+    Runs on every loadout-workspace switch. With no `loadout:` marks on any
+    window this is a no-op. Otherwise the loadout TOML is re-read and every
+    entry swept in order (see `sweep_discrepancy`): the first failure unloads
+    immediately so all workspace buttons turn red, and the user reloads
+    explicitly afterwards. There is no repair step and focus is untouched.
     """
+    tree = get_tree()
+    if not any(
+        any(mark.startswith(MARK_PREFIX) for mark in w.marks)
+        for w in windows(tree)
+    ):
+        return 0
     spec = active_spec()
     if spec is None:
-        return 0
-    tree = get_tree()
-    current = windows(tree)
-    stayed = focused_workspace(tree)
-
-    emacs_entry = next((e for e in spec.entries if e.kind == "emacs"), None)
-    emacs_con_id: int | None = None
-    for node, workspace in walk(tree):
-        if node.get("window") is not None and window_class(node).lower() == "emacs":
-            emacs_con_id = int(node["id"])
-            break
-
-    # Membership is per-entry: each managed window carries a unique
-    # `loadout-win:<ident>` mark (the `loadout:<root>` beacon migrates between
-    # windows by design — i3 keeps one window per mark name — so it is useless
-    # for enumeration). The pretty entry names only live in ws.py's rename
-    # overlay, never in the i3 tree.
+        unload()
+        print("Loadout unloaded: loadout file missing or unreadable")
+        return 1
     present: dict[str, Window] = {}
-    for w in current:
+    for w in windows(tree):
         for mark in w.marks:
             if mark.startswith(WINDOW_MARK_PREFIX):
                 present[mark[len(WINDOW_MARK_PREFIX):]] = w
-
-    managed = {w.con_id for w in present.values()}
-    # The emacs may lack its `loadout-win:` mark (e.g. an aborted fallback
-    # launch left it orphaned). Such an emacs is about to be claimed below, so
-    # do not treat it as an obstacle. Only do this when no window carries the
-    # emacs mark; once a marked emacs exists every other emacs is foreign.
-    if (emacs_entry is not None and emacs_con_id is not None
-            and emacs_entry.ident not in present and emacs_con_id not in managed):
-        managed.add(emacs_con_id)
-
-    # A workspace only needs evicting when an entry is missing or displaced and
-    # has to move onto it. Extra windows sharing a healthy slot (say a browser
-    # sitting on top of the emacs) block nothing and are the user's own
-    # business — they must not nag on every switch forever.
-    needed = {e.slot for e in spec.entries
-              if e.ident not in present or present[e.ident].workspace != e.slot}
-    obstacles = [w for w in current if w.workspace in needed and w.con_id not in managed]
-    if obstacles and not force:
-        _ask_blockers(spec, obstacles)
-        return 1
-
-    controller = Controller(spec)
-    if obstacles:
-        kill_windows(obstacles)
-
-    if emacs_entry is not None:
-        win = present.get(emacs_entry.ident)
-        if win is None:
-            if emacs_con_id is not None:
-                controller.claim(emacs_entry, emacs_con_id)
-            else:
-                controller.launch(emacs_entry)
-        elif win.workspace != emacs_entry.slot:
-            controller.claim(emacs_entry, win.con_id)
-
-    for entry in spec.entries:
-        if entry.kind != "terminal":
-            continue
-        win = present.get(entry.ident)
-        if win is None:
-            controller.launch(entry)
-        elif win.workspace != entry.slot:
-            controller.claim(entry, win.con_id)
-
-    # Internal placement self-healing. Every window now sits on its slot, but
-    # a reused terminal may have been cd'd away from its loadout directory
-    # and an adopted emacs may be planted on a different directory. Per the
-    # shift contract a drifted terminal is restarted in place; a misplanted
-    # emacs is replanted via its own entry function. Best-effort: never
-    # blocks a switch, never asks. A terminal whose state cannot be inspected
-    # (no pid, or st running a program rather than a shell) is left alone.
-    for entry in spec.entries:
-        if entry.kind != "terminal":
-            continue
-        win = present.get(entry.ident)
-        if win is None:
-            continue
-        cwd = terminal_cwd(win)
-        if cwd is not None and os.path.realpath(cwd) != os.path.realpath(entry.cwd):
-            kill_windows([win])
-            controller.launch(entry)
-            print(f"  terminal {entry.ident}: restarted at {entry.cwd}")
-
-    if emacs_entry is not None:
-        win = present.get(emacs_entry.ident)
-        if win is not None or emacs_con_id is not None:
-            drifted = not emacs_plant_matches(emacs_entry.cwd)
-            db_root = planted_db_root()
-            if db_root is not None and os.path.realpath(db_root) != os.path.realpath(emacs_entry.cwd):
-                drifted = True
-            if drifted:
-                if restore_emacs_plant(emacs_entry.cwd):
-                    print(f"  emacs {emacs_entry.ident}: plant -> {emacs_entry.cwd}")
-
-    if stayed:
-        i3(f"workspace {quote(stayed)}")
-    print(f"Loadout healthy: {spec.source}")
-    return 0
+    why = sweep_discrepancy(spec, present)
+    if why is None:
+        print(f"Loadout healthy: {spec.source}")
+        return 0
+    unload()
+    print(f"Loadout unloaded: {why}")
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -842,7 +773,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("unload")
     sub.add_parser("status")
     p_heal = sub.add_parser("heal")
-    p_heal.add_argument("--force", action="store_true")
     p_occ = sub.add_parser("_occupied", help=argparse.SUPPRESS)
     p_occ.add_argument("file")
     return parser
@@ -870,7 +800,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcommand == "status":
             return status()
         if args.subcommand == "heal":
-            return heal(args.force)
+            return heal()
         if args.subcommand == "_occupied":
             spec = load_spec(args.file)
             _, leftover = plan(spec, get_tree())

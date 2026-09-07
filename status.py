@@ -171,7 +171,8 @@ def main():
 
     def emit():
         nonlocal first
-        state_block = {"full_text": state}
+        color = "#00ff00" if state == "LOCKED" else "#ff5252"
+        state_block = {"full_text": state, "color": color}
         blocks = [state_block] + [{"full_text": b} for b in slow_blocks] + \
                  [{"full_text": time_block()}]
         line = json.dumps(blocks, ensure_ascii=False)

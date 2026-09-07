@@ -384,7 +384,7 @@ def wait_new(before: set[int], *, pid: int | None = None, title: str | None = No
             match = [w for w in new if w.pid == pid]
             if len(match) == 1:
                 return match[0]
-        if len(new) == 1:
+        if title is None and len(new) == 1:
             return new[0]
         time.sleep(0.05)
     raise LoadoutError("timed out waiting for application window")
@@ -532,9 +532,11 @@ class Controller:
     watched, or restarted when a window is closed afterwards.
     """
 
-    def __init__(self, spec: Spec, adopted: dict[str, int] | None = None):
+    def __init__(self, spec: Spec, adopted: dict[str, int] | None = None,
+                 *, emacs_driven: bool = False):
         self.spec = spec
         self.adopted = adopted or {}
+        self.emacs_driven = emacs_driven
         self.original_workspace: str | None = None
         self.mark = MARK_PREFIX + str(spec.root)
 
@@ -570,9 +572,18 @@ class Controller:
                 if result.returncode != 0:
                     raise LoadoutError(result.stderr.strip() or "emacsclient could not create a frame")
                 win = wait_new(before, title=title)
-                planted = run(["emacsclient", "--eval", emacs_plant(entry.cwd)])
-                if planted.returncode != 0:
-                    raise LoadoutError(planted.stderr.strip() or "could not plant Emacs workspace")
+                if not self.emacs_driven:
+                    # Plant here only when the server is idle. When the LOCK is a
+                    # nested call-process from the very emacs we are talking to,
+                    # the server is blocked and its replies to --eval requests
+                    # get dropped ("connection broken by remote peer"); the plant
+                    # would silently never happen and the first heal after the
+                    # switch would unload on "planted elsewhere". The emacs
+                    # driver therefore passes --emacs-driven and plants itself
+                    # AFTER this call-process returns.
+                    planted = run(["emacsclient", "--eval", emacs_plant(entry.cwd)])
+                    if planted.returncode != 0:
+                        raise LoadoutError(planted.stderr.strip() or "could not plant Emacs workspace")
             else:
                 # No reachable server: spawn a fresh emacs that owns this
                 # loadout. It plants itself inline in the --eval (no separate
@@ -623,7 +634,7 @@ class Controller:
             i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
         if entry.kind == "terminal":
             rename_window(win, entry.name)
-        elif entry.kind == "emacs":
+        elif entry.kind == "emacs" and not self.emacs_driven:
             run(["emacsclient", "--eval", emacs_plant(entry.cwd)])
 
     def initial_launch(self) -> None:
@@ -636,7 +647,7 @@ class Controller:
             i3(f"workspace {quote(self.original_workspace)}")
 
 
-def lock(filename: str) -> int:
+def lock(filename: str, *, emacs_driven: bool = False) -> int:
     """Materialize the loadout once, then exit.
 
     One-shot: kill confirmed leftover windows first, then adopt the first emacs,
@@ -652,7 +663,7 @@ def lock(filename: str) -> int:
         return 0
 
     clear_marks()
-    controller = Controller(spec, adopted)
+    controller = Controller(spec, adopted, emacs_driven=emacs_driven)
     controller.original_workspace = focused_workspace(tree)
     # Kill the confirmed occupants before anything else: a `load` typed in a
     # terminal that lives on a target workspace kills that terminal, and main()
@@ -770,12 +781,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="materialize an i3 project loadout")
     sub = parser.add_subparsers(dest="subcommand")
     p_lock = sub.add_parser("lock")
+    p_lock.add_argument("--emacs-driven", action="store_true",
+                        help="the calling emacs owns the loadout's emacs entry; "
+                             "create its frame but do not plant (the caller "
+                             "plants after this process returns)")
     p_lock.add_argument("file")
     sub.add_parser("unload")
     sub.add_parser("status")
     p_heal = sub.add_parser("heal")
     p_occ = sub.add_parser("_occupied", help=argparse.SUPPRESS)
     p_occ.add_argument("file")
+    p_emacs = sub.add_parser("_emacs_path", help=argparse.SUPPRESS)
+    p_emacs.add_argument("file")
     return parser
 
 
@@ -795,7 +812,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.subcommand == "lock":
-            return lock(args.file)
+            return lock(args.file, emacs_driven=args.emacs_driven)
         if args.subcommand == "unload":
             return unload()
         if args.subcommand == "status":
@@ -810,6 +827,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(description)
                 return 1
             return 0
+        if args.subcommand == "_emacs_path":
+            spec = load_spec(args.file)
+            entry = next((e for e in spec.entries if e.kind == "emacs"), None)
+            if entry is not None:
+                print(entry.cwd)
+                return 0
+            return 1
         build_parser().print_help()
         return 2
     except LoadoutError as exc:

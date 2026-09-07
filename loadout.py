@@ -541,7 +541,6 @@ class Controller:
     def launch(self, entry: Entry) -> None:
         before = {w.con_id for w in windows(get_tree())}
         title = "__loadout__" + entry.ident.replace(":", "_") + "__"
-        i3(f"workspace {quote(entry.slot)}")
 
         if entry.kind == "terminal":
             command = terminal_command(entry, title)

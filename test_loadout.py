@@ -537,6 +537,32 @@ class TerminalLaunchTests(unittest.TestCase):
             loadout.Controller(spec).launch(entry)
         self.assertIsNone(envs[0].get("LOADOUT_SCRIPT"))
 
+    def test_launch_moves_window_to_slot_without_switching_workspace(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        commands = []
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.pid = 999
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(loadout, "i3", side_effect=commands.append), \
+             patch.object(loadout, "get_tree", return_value={}), \
+             patch.object(loadout.subprocess, "Popen",
+                          return_value=FakePopen(["st", "-e", "mksh"])), \
+             patch.object(loadout, "wait_new",
+                          return_value=loadout.Window(1, 100, 999, "t", "m", ())), \
+             patch.object(loadout, "rename_window"):
+            loadout.Controller(spec).launch(entry)
+        self.assertFalse(any(c.startswith("workspace ") for c in commands), commands)
+        self.assertTrue(any(f"move container to workspace {loadout.quote('j')}" in c for c in commands),
+                        commands)
+
 
 if __name__ == "__main__":
     unittest.main()

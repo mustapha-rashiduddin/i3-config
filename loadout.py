@@ -691,6 +691,30 @@ def unload() -> int:
     return 0
 
 
+def unload_if_planted_other(dir_name: str) -> int:
+    """Unload the engaged loadout when the speed-dial plant moves elsewhere.
+
+    The plant command writes the global_workspace row (and the emacs plant sets
+    the same state); a loadout whose emacs entry is anchored on a different
+    directory has lost its anchor and must be released right away, not served
+    half-loaded until the next switch-away heal notices the drift. Planting the
+    loadout's own directory is a no-op (e.g. the plant issued at the end of a
+    load); with no emacs entry there is nothing anchored to check.
+    """
+    spec = active_spec()
+    if spec is None:
+        return 0
+    emacs_entry = next((e for e in spec.entries if e.kind == "emacs"), None)
+    if emacs_entry is None:
+        return 0
+    target = Path(dir_name)
+    if os.path.realpath(target) == os.path.realpath(emacs_entry.cwd):
+        return 0
+    unload()
+    print(f"Loadout unloaded: planted {target}, expected {emacs_entry.cwd}")
+    return 1
+
+
 def status() -> int:
     print("unloaded")
     return 1
@@ -793,6 +817,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_occ.add_argument("file")
     p_emacs = sub.add_parser("_emacs_path", help=argparse.SUPPRESS)
     p_emacs.add_argument("file")
+    p_unload_other = sub.add_parser("_unload_if_other", help=argparse.SUPPRESS)
+    p_unload_other.add_argument("dir")
     return parser
 
 
@@ -834,6 +860,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(entry.cwd)
                 return 0
             return 1
+        if args.subcommand == "_unload_if_other":
+            return unload_if_planted_other(args.dir)
         build_parser().print_help()
         return 2
     except LoadoutError as exc:

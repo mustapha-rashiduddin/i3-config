@@ -385,6 +385,40 @@ class HealTests(unittest.TestCase):
             self.assertEqual(loadout.heal(), 1)
         unload.assert_called_once_with()
 
+    def test_unload_if_other_noop_when_not_engaged(self):
+        patch.object(loadout, "active_spec", return_value=None).start()
+        unload = patch.object(loadout, "unload").start()
+        self.addCleanup(patch.stopall)
+        self.assertEqual(loadout.unload_if_planted_other("/elsewhere"), 0)
+        unload.assert_not_called()
+
+    def test_unload_if_other_noop_without_emacs_entry(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        patch.object(loadout, "active_spec", return_value=spec).start()
+        unload = patch.object(loadout, "unload").start()
+        self.addCleanup(patch.stopall)
+        self.assertEqual(loadout.unload_if_planted_other("/elsewhere"), 0)
+        unload.assert_not_called()
+
+    def test_unload_if_other_noop_on_same_directory(self):
+        emacs = self._entry("emacs:0", "emacs", "l", "emacs", cwd=Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        patch.object(loadout, "active_spec", return_value=spec).start()
+        unload = patch.object(loadout, "unload").start()
+        self.addCleanup(patch.stopall)
+        self.assertEqual(loadout.unload_if_planted_other("/tmp/"), 0)
+        unload.assert_not_called()
+
+    def test_unload_if_other_releases_on_different_directory(self):
+        emacs = self._entry("emacs:0", "emacs", "l", "emacs", cwd=Path("/tmp"))
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (emacs,))
+        patch.object(loadout, "active_spec", return_value=spec).start()
+        unload = patch.object(loadout, "unload").start()
+        self.addCleanup(patch.stopall)
+        self.assertEqual(loadout.unload_if_planted_other("/elsewhere"), 1)
+        unload.assert_called_once_with()
+
     def test_extra_window_on_healthy_slot_does_not_unload(self):
         entry = self._entry()
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))

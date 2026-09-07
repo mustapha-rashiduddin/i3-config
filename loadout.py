@@ -623,6 +623,8 @@ class Controller:
             i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
         if entry.kind == "terminal":
             rename_window(win, entry.name)
+        elif entry.kind == "emacs":
+            run(["emacsclient", "--eval", emacs_plant(entry.cwd)])
 
     def initial_launch(self) -> None:
         for entry in self.spec.entries:

@@ -20,17 +20,6 @@ def run(cmd, timeout=3):
         return ""
 
 
-def screen_width():
-    w = 0
-    try:
-        data = json.loads(run(["i3-msg", "-t", "get_workspaces"]))
-        for ws in data:
-            w = max(w, ws.get("rect", {}).get("width", 0))
-    except Exception:
-        pass
-    return w
-
-
 def vol_block():
     v = run(["pamixer", "--get-volume"])
     muted = run(["pamixer", "--get-mute"]) == "true"
@@ -93,8 +82,6 @@ SLOW_INTERVAL = 5.0
 def main():
     slow_last = 0.0
     slow_blocks = [None] * len(SLOW_FUNCS)
-    width = 0
-    image_w = 600
     first = True
 
     print(json.dumps({"version": 1}), flush=True)
@@ -104,17 +91,8 @@ def main():
         now = time.time()
         if now - slow_last >= SLOW_INTERVAL:
             slow_blocks = [fn() for fn in SLOW_FUNCS]
-            width = screen_width()
             slow_last = now
-        blocks = [
-            {
-                "full_text": "",
-                "separator": False,
-                "align": "left",
-                "min_width": max(width - image_w, 0),
-            }
-        ]
-        blocks += [{"full_text": b} for b in slow_blocks] + [{"full_text": time_block()}]
+        blocks = [{"full_text": b} for b in slow_blocks] + [{"full_text": time_block()}]
         line = json.dumps(blocks, ensure_ascii=False)
         if not first:
             line = "," + line

@@ -28,7 +28,7 @@ CHAR_W = 12
 PAD_W = 11
 ELL = "\u2026"
 
-BOX_WIDTH = 220
+BOX_WIDTH = 231
 
 _snapshot = {
     "workspaces": [],
@@ -424,6 +424,12 @@ def handle_event(line):
                 _snapshot["workspaces"].append({"name": new_name, "focused": True})
         _refresh_event.set()
         return
+    if change == "mark":
+        # loadout lock/unlock and tag changes land here; refresh the tree
+        # immediately instead of waiting for the 1s poll so workspace buttons
+        # flip green/red the moment marks are added or cleared.
+        _refresh_event.set()
+        return
     c = ev.get("container") or {}
     xid = c.get("window")
     con_id = str(c.get("id", ""))
@@ -511,7 +517,7 @@ def main():
         try:
             proc = subprocess.Popen(
                 ["i3-msg", "-t", "subscribe", "-m",
-                 '["workspace","output","window","tick"]'],
+                 '["workspace","output","window","mark","tick"]'],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except Exception:
             time.sleep(1)

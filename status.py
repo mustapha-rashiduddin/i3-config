@@ -84,6 +84,14 @@ def bat_percent():
         return None
 
 
+def bat_charging():
+    try:
+        with open("/sys/class/power_supply/BAT0/status") as f:
+            return f.read().strip() != "Discharging"
+    except Exception:
+        return None
+
+
 def bat_block():
     cap = bat_percent()
     if cap is None:
@@ -109,6 +117,17 @@ def mem_block():
         if len(f) >= 7 and f[0].startswith("Mem"):
             return f"{f[2]} | {f[6]}"
     return "MEM: ?"
+
+
+def mem_available_mb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        return None
+    return None
 
 
 def disk_block():
@@ -186,10 +205,16 @@ def main():
         blocks = [state_block]
         on_second = int(time.time()) % 2
         cap = bat_percent()
-        low_bat = cap is not None and cap < 15
+        low_bat = cap is not None and cap < 15 and not bat_charging()
+        avail = mem_available_mb()
+        low_mem = avail is not None and avail <= 800
         for idx, block in enumerate(slow_blocks):
             item = {"full_text": block}
-            if idx == SLOW_FUNCS.index(bat_block) and low_bat and on_second and block is not None:
+            flash = (
+                (idx == SLOW_FUNCS.index(bat_block) and low_bat)
+                or (idx == SLOW_FUNCS.index(mem_block) and low_mem)
+            )
+            if flash and on_second and block is not None:
                 item["color"] = BAT_FLASH_COLOR
             blocks.append(item)
         blocks += [{"full_text": time_block()}]

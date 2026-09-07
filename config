@@ -4,6 +4,7 @@ font pango:monospace 14
 
 exec --no-startup-id dex --autostart --environment i3
 exec --no-startup-id xss-lock --transfer-sleep-lock -- i3lock --nofork
+exec --no-startup-id feh --bg-fill /run/current-system/sw/share/backgrounds/nixos/nix-wallpaper-simple-dark-gray.png
 
 # NetworkManager is the most popular way to manage wireless networks on Linux,
 # and nm-applet is a desktop environment-independent system tray GUI for it.

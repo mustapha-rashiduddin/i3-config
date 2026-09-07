@@ -21,6 +21,7 @@ from pathlib import Path
 
 LOADOUT_MARK = "loadout:"
 SD_DB = Path.home() / "emacs-speed-dial" / "speed-dial.sqlite"
+BAT_FLASH_COLOR = "#ff0000"
 
 
 def run(cmd, timeout=3):
@@ -75,10 +76,19 @@ def vol_block():
     return f"♪: muted ({v}%)" if muted else f"♪: {v}%"
 
 
-def bat_block():
+def bat_percent():
     try:
         with open("/sys/class/power_supply/BAT0/capacity") as f:
-            cap = f.read().strip()
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def bat_block():
+    cap = bat_percent()
+    if cap is None:
+        return "BAT: ?"
+    try:
         with open("/sys/class/power_supply/BAT0/status") as f:
             st = f.read().strip()
     except Exception:
@@ -173,8 +183,16 @@ def main():
         nonlocal first
         color = "#00ff00" if state == "LOCKED" else "#ff5252"
         state_block = {"full_text": state, "color": color}
-        blocks = [state_block] + [{"full_text": b} for b in slow_blocks] + \
-                 [{"full_text": time_block()}]
+        blocks = [state_block]
+        on_second = int(time.time()) % 2
+        cap = bat_percent()
+        low_bat = cap is not None and cap < 15
+        for idx, block in enumerate(slow_blocks):
+            item = {"full_text": block}
+            if idx == SLOW_FUNCS.index(bat_block) and low_bat and on_second and block is not None:
+                item["color"] = BAT_FLASH_COLOR
+            blocks.append(item)
+        blocks += [{"full_text": time_block()}]
         line = json.dumps(blocks, ensure_ascii=False)
         if not first:
             line = "," + line

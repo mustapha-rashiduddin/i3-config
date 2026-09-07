@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
+"""Top-of-screen i3bar: system status blocks only (disk/mem/load/vol/bat/time).
+
+The workspace buttons live on the bottom bar (ws.py); this bar never touches
+the i3 tree. Status is sampled on a slow cadence except the clock, which ticks
+every second.
+"""
 import json
-import select
 import subprocess
+import sys
 import time
 from datetime import datetime
 
@@ -80,62 +86,41 @@ def time_block():
     return datetime.now().strftime("{ %A } %d/%m/%Y %H:%M:%S")
 
 
-def render_blocks():
-    width = screen_width()
-    blocks = [
-        {
-            "full_text": "",
-            "separator": False,
-            "align": "left",
-            "min_width": max(width - 600, 0),
-        }
-    ]
-    for text in [disk_block(), mem_block(), load_block(), vol_block(),
-                 bat_block(), time_block()]:
-        blocks.append({"full_text": text})
-    return blocks
+SLOW_FUNCS = (vol_block, bat_block, mem_block, disk_block, load_block)
+SLOW_INTERVAL = 5.0
 
 
 def main():
-    # i3bar consumes the header separately, then feeds the rest of the pipe to
-    # a streaming JSON parser that rejects trailing garbage. It therefore
-    # expects ONE continuous top-level array (the i3status style):
-    #   {"version":1}
-    #   [
-    #   [blocks]
-    #   ,[blocks]
-    #   ...
-    # Each inner array is one bar update. Emitting separate top-level arrays
-    # makes the parser fail on the second one.
+    slow_last = 0.0
+    slow_blocks = [None] * len(SLOW_FUNCS)
+    width = 0
+    image_w = 600
+    first = True
+
     print(json.dumps({"version": 1}), flush=True)
     print("[", flush=True)
-    first = True
-    last_render = 0.0
+
     while True:
-        try:
-            line = json.dumps(render_blocks())
-            if first:
-                print(line, flush=True)
-                first = False
-            else:
-                print("," + line, flush=True)
-            last_render = time.time()
-            proc = subprocess.Popen(
-                ["i3-msg", "-t", "subscribe", "-m", '["workspace","window"]'],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            while proc.poll() is None:
-                ready, _, _ = select.select([proc.stdout], [], [], 1.0)
-                if ready:
-                    line = proc.stdout.readline()
-                    if line and time.time() - last_render >= 0.2:
-                        print("," + json.dumps(render_blocks()), flush=True)
-                        last_render = time.time()
-                elif time.time() - last_render >= 1.0:
-                    print("," + json.dumps(render_blocks()), flush=True)
-                    last_render = time.time()
-            proc.wait()
-        except Exception:
-            pass
+        now = time.time()
+        if now - slow_last >= SLOW_INTERVAL:
+            slow_blocks = [fn() for fn in SLOW_FUNCS]
+            width = screen_width()
+            slow_last = now
+        blocks = [
+            {
+                "full_text": "",
+                "separator": False,
+                "align": "left",
+                "min_width": max(width - image_w, 0),
+            }
+        ]
+        blocks += [{"full_text": b} for b in slow_blocks] + [{"full_text": time_block()}]
+        line = json.dumps(blocks, ensure_ascii=False)
+        if not first:
+            line = "," + line
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        first = False
         time.sleep(1)
 
 

@@ -137,12 +137,20 @@ mode "resize" {
 }
 
 bar {
+        id sysbar
+        position top
+        workspace_buttons no
+        binding_mode_indicator no
+        status_command /home/saifr/.config/i3/status.py
+        tray_output primary
+}
+
+bar {
         id wsbar
         position bottom
         workspace_buttons no
         binding_mode_indicator no
         status_command /home/saifr/.config/i3/ws.py
-        tray_output primary
 }
 
 bindsym $mod+e exec --no-startup-id env PATH="$HOME/.config/i3/chrome-sync:$PATH" dmenu_run

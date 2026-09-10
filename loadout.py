@@ -16,8 +16,14 @@ Example loadout:
     path = "."
     command = ["st", "-e", "mksh"]
 
-    [emacs]
+    [[terminal]]
     slot = "l"
+    name = "code"
+    path = "./src"
+    emacs = true  # spawn st -e emacs -nw at that path, planted on it, no `o` needed
+
+    [emacs]
+    slot = ";"
     path = "."
 
 Run directly as:
@@ -79,6 +85,7 @@ class Entry:
     cwd: Path
     command: tuple[str, ...] = ()
     script: str | None = None
+    emacs: bool = False
 
     @property
     def mark(self) -> str:
@@ -211,7 +218,17 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
         slot = item.get("slot")
         name = item.get("name")
         path = item.get("path", ".")
+        run_emacs = item.get("emacs", False)
+        if not isinstance(run_emacs, bool):
+            raise LoadoutError(f"terminal {n}: emacs must be a boolean")
+        provided_command = "command" in item
         command = item.get("command", ["st", "-e", "mksh"])
+        if run_emacs:
+            if provided_command:
+                raise LoadoutError(f"terminal {n}: emacs and command are mutually exclusive")
+            if "script" in item:
+                raise LoadoutError(f"terminal {n}: emacs and script are mutually exclusive")
+            command = ["st", "-e", "emacs", "-nw"]
         if slot not in ROW_KEYS:
             raise LoadoutError(f"terminal {n}: invalid slot {slot!r}")
         if not isinstance(name, str) or not name.strip():
@@ -231,6 +248,7 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
             cwd=resolve_cwd(root, path),
             command=tuple(command),
             script=script,
+            emacs=run_emacs,
         ))
 
     emacs = data.get("emacs")
@@ -398,6 +416,23 @@ def emacs_plant(path: Path) -> str:
     return f"(my/lock-workspace-to-dir {elisp_string(str(path))})"
 
 
+def emacs_terminal_plant_file(cwd: Path) -> Path:
+    """Write the plant snippet a freshly spawned `emacs -nw` loads via -l.
+
+    A plain `emacs -nw` shares nothing with a running emacs (no reachable
+    server, and --eval proved flaky under the full init), so the speed-dial
+    workspace plant runs in-process right after init through a -l file.
+    """
+    content = (
+        f"(progn (when (fboundp (quote my/lock-workspace-to-dir)) "
+        f"(my/lock-workspace-to-dir {elisp_string(str(cwd))})))"
+    )
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CACHE_DIR / "emacs-plant.el"
+    path.write_text(content + "\n")
+    return path
+
+
 def terminal_command(entry: Entry, private_title: str) -> list[str]:
     command = list(entry.command)
     if command and Path(command[0]).name == "st":
@@ -546,6 +581,8 @@ class Controller:
 
         if entry.kind == "terminal":
             command = terminal_command(entry, title)
+            if entry.emacs:
+                command = [*command, "-l", str(emacs_terminal_plant_file(entry.cwd))]
             env = dict(os.environ)
             if entry.script:
                 env["LOADOUT_SCRIPT"] = entry.script

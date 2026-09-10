@@ -72,6 +72,38 @@ name = "plain"
             self.assertEqual(spec.entries[0].script, "sqlite3")
             self.assertIsNone(spec.entries[1].script)
 
+    def test_terminal_emacs_flag_runs_emacs_nw(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text('''
+[[terminal]]
+slot = "j"
+name = "code"
+emacs = true
+''')
+            spec = loadout.load_spec(file)
+            self.assertEqual(spec.entries[0].command, ("st", "-e", "emacs", "-nw"))
+            self.assertEqual(spec.entries[0].cwd, Path(td).resolve())
+            self.assertIsNone(spec.entries[0].script)
+
+    def test_terminal_emacs_flag_marks_config_invalid(self):
+        with tempfile.TemporaryDirectory() as td:
+            bad = [
+                "emacs = true\ncommand = [\"st\", \"-e\", \"mksh\"]",
+                "emacs = true\nscript = \"sqlite3\"",
+                "emacs = \"yes\"",
+            ]
+            for extras in bad:
+                file = Path(td) / "loadout"
+                file.write_text(f'''
+[[terminal]]
+slot = "j"
+name = "code"
+{extras}
+''')
+                with self.assertRaises(loadout.LoadoutError):
+                    loadout.load_spec(file)
+
 
 class PlanTests(unittest.TestCase):
     spec = None
@@ -545,6 +577,38 @@ class TerminalLaunchTests(unittest.TestCase):
             loadout.Controller(spec).launch(self._entry())
         self.assertEqual(envs[0].get("LOADOUT_SCRIPT"), "sql")
         self.assertEqual(envs[0].get("LOADOUT_CWD"), str(Path("/tmp")))
+
+    def test_launch_emacs_terminal_plants_loadout_root(self):
+        entry = loadout.Entry("terminal:0", "terminal", "j", "code", Path("/tmp"),
+                              ("st", "-e", "emacs", "-nw"), None, emacs=True)
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        spawned = {}
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.pid = 777
+                spawned["argv"] = argv
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(loadout, "i3"), \
+             patch.object(loadout, "get_tree", return_value={}), \
+             patch.object(loadout.subprocess, "Popen", side_effect=FakePopen), \
+             patch.object(loadout, "wait_new",
+                          return_value=loadout.Window(1, 100, 777, "t", "j", ())), \
+             patch.object(loadout, "rename_window"):
+            loadout.Controller(spec).launch(entry)
+        a = spawned["argv"]
+        self.assertEqual(a[:2], ["st", "-t"])
+        self.assertEqual(a[3:5], ["-e", "emacs"])
+        self.assertEqual(a[5], "-nw")
+        self.assertEqual(a[6], "-l")
+        expr = Path(a[a.index("-l") + 1]).read_text()
+        self.assertIn("my/lock-workspace-to-dir", expr)
+        self.assertIn("/tmp", expr)
 
     def test_launch_without_script_leaves_env_alone(self):
         entry = loadout.Entry("terminal:0", "terminal", "j", "sql", Path("/tmp"),

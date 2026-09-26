@@ -231,15 +231,26 @@ def _parse_loadout_slots(path):
             data = tomllib.load(f)
     except Exception:
         return set()
-    slots = set()
+    used = set()
+    auto = 0
+
+    def add(slot):
+        nonlocal auto
+        if not slot:
+            while auto < len(ROW_KEYS) and ROW_KEYS[auto] in used:
+                auto += 1
+            if auto >= len(ROW_KEYS):
+                return
+            slot = ROW_KEYS[auto]
+            auto += 1
+        used.add(slot)
+
     for item in data.get("terminal") or []:
-        slot = item.get("slot") if isinstance(item, dict) else None
-        if slot:
-            slots.add(slot)
+        add(item.get("slot") if isinstance(item, dict) else None)
     emacs = data.get("emacs")
-    if isinstance(emacs, dict) and emacs.get("slot"):
-        slots.add(emacs["slot"])
-    return slots
+    if isinstance(emacs, dict):
+        add(emacs.get("slot"))
+    return used
 
 
 def loadout_keys(tree):

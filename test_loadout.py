@@ -55,6 +55,66 @@ name = "bad"
             with self.assertRaises(loadout.LoadoutError):
                 loadout.load_spec(file)
 
+    def test_slots_auto_assign_in_declaration_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text('''
+[[terminal]]
+name = "one"
+
+[[terminal]]
+name = "two"
+
+[[terminal]]
+name = "three"
+
+[emacs]
+''')
+            spec = loadout.load_spec(file)
+            self.assertEqual([e.slot for e in spec.entries], ["j", "k", "l", ";"])
+            self.assertEqual(spec.slots, frozenset({"j", "k", "l", ";"}))
+
+    def test_auto_assign_skips_explicit_slots(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text('''
+[[terminal]]
+slot = "k"
+name = "explicit"
+
+[[terminal]]
+name = "auto"
+''')
+            spec = loadout.load_spec(file)
+            self.assertEqual([e.slot for e in spec.entries], ["k", "j"])
+
+    def test_auto_assign_reuses_early_keys_after_explicit_later_slot(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text('''
+[[terminal]]
+slot = ";"
+name = "first"
+
+[[terminal]]
+name = "second"
+
+[[terminal]]
+name = "third"
+''')
+            spec = loadout.load_spec(file)
+            self.assertEqual([e.slot for e in spec.entries], [";", "j", "k"])
+
+    def test_auto_assign_exhausts_row_keys(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text("".join("""
+[[terminal]]
+name = "t%d"
+""" % i for i in range(len(loadout.ROW_KEYS) + 1)))
+            with self.assertRaises(loadout.LoadoutError):
+                loadout.load_spec(file)
+
     def test_terminal_script_is_parsed(self):
         with tempfile.TemporaryDirectory() as td:
             file = Path(td) / "loadout"

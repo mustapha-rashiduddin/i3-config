@@ -6,25 +6,26 @@ The directory containing the TOML file is the loadout root.
 Example loadout:
 
     [[terminal]]
-    slot = "j"
     name = "sql"
     path = "./db"
 
     [[terminal]]
-    slot = "k"
     name = "server"
     path = "."
     command = ["st", "-e", "mksh"]
 
     [[terminal]]
-    slot = "l"
     name = "code"
     path = "./src"
     emacs = true  # spawn st -e emacs -nw at that path, planted on it, no `o` needed
 
     [emacs]
-    slot = ";"
     path = "."
+
+Slots default to the first free row key in declaration order (j, k, l, ;,
+m, ,, ., /), so they can be omitted above. An explicit `slot` still wins:
+it must be one of the row keys, and the automatic scanner skips keys already
+taken by an explicit slot (or by an earlier automatic assignment).
 
 Run directly as:
 
@@ -212,6 +213,24 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
     if not isinstance(terminals, list):
         raise LoadoutError("[[terminal]] must be an array of tables")
 
+    used: set[str] = set()
+    auto = 0
+
+    def assign(slot: str | None, where: str) -> str:
+        """Validate an explicit slot or hand out the first free row key."""
+        nonlocal auto
+        if slot is None:
+            while auto < len(ROW_KEYS) and ROW_KEYS[auto] in used:
+                auto += 1
+            if auto >= len(ROW_KEYS):
+                raise LoadoutError(f"{where}: no free slot left (ROW_KEYS exhausted)")
+            slot = ROW_KEYS[auto]
+            auto += 1
+        elif slot not in ROW_KEYS:
+            raise LoadoutError(f"{where}: invalid slot {slot!r}")
+        used.add(slot)
+        return slot
+
     for n, item in enumerate(terminals):
         if not isinstance(item, dict):
             raise LoadoutError("each [[terminal]] entry must be a table")
@@ -221,6 +240,7 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
         run_emacs = item.get("emacs", False)
         if not isinstance(run_emacs, bool):
             raise LoadoutError(f"terminal {n}: emacs must be a boolean")
+        slot = assign(slot, f"terminal {n}")
         provided_command = "command" in item
         command = item.get("command", ["st", "-e", "mksh"])
         if run_emacs:
@@ -229,8 +249,6 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
             if "script" in item:
                 raise LoadoutError(f"terminal {n}: emacs and script are mutually exclusive")
             command = ["st", "-e", "emacs", "-nw"]
-        if slot not in ROW_KEYS:
-            raise LoadoutError(f"terminal {n}: invalid slot {slot!r}")
         if not isinstance(name, str) or not name.strip():
             raise LoadoutError(f"terminal {n}: name is required")
         if not isinstance(path, str):
@@ -258,8 +276,7 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
         slot = emacs.get("slot")
         path = emacs.get("path", ".")
         name = emacs.get("name", "emacs")
-        if slot not in ROW_KEYS:
-            raise LoadoutError(f"emacs: invalid slot {slot!r}")
+        slot = assign(slot, "emacs")
         if not isinstance(path, str):
             raise LoadoutError("emacs: path must be a string")
         if not isinstance(name, str) or not name.strip():

@@ -167,3 +167,16 @@ bindsym Print exec --no-startup-id maim "/home/$USER/screenshots/screenshot_$(da
 bindsym Shift+Print exec --no-startup-id maim -s "/home/$USER/screenshots/screenshot_$(date +%s).png"
 
 default_border pixel 1
+
+# The blue frame was the 2nd field, not the 1st. i3 takes
+# <border> <background> <indicator> <child_border>, but the 1px ring that
+# default_border draws around the focused window came out #285577 -- i3's stock
+# *background* -- and #4c7899 (the stock border) never appeared in it. Setting
+# only the border field changed nothing; setting the background field did. So
+# all three frame fields take cosmic-term's background, #1b1b1b (the gray_1
+# cosmic_dark() leaves to theme.cosmic().background.base), which also keeps i3
+# blue out of nested splits. indicator stays stock: it is the titlebar text.
+# (Why i3 paints the background into the ring, rather than the border, is not
+# explained -- i3 4.24 is unpatched here and the exact on-screen shade came out
+# slightly lighter than #1b1b1b.)
+client.focused #1b1b1b #1b1b1b #ffffff #1b1b1b

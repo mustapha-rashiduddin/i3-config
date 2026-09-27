@@ -247,8 +247,8 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
     def parse_browser(n: int, item: dict[str, Any]) -> Entry:
         slot = assign(item.get("slot"), f"browser {n}")
         url = item.get("url")
-        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-            raise LoadoutError(f"browser {n}: url must be an http(s) string")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://", "file://")):
+            raise LoadoutError(f"browser {n}: url must be an http(s) or file URL")
         name = item.get("name") or urllib.parse.urlsplit(url).hostname or url
         path = item.get("path", ".")
         scroll = item.get("scroll")

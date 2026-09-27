@@ -204,6 +204,16 @@ url = {None if url is None else '"%s"' % url}
                 with self.assertRaises(loadout.LoadoutError):
                     loadout.load_spec(file)
 
+    def test_browser_accepts_file_urls(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text('''
+[[browser]]
+url = "file:///home/saifr/Documents/lf/Basics.html#lab25"
+''')
+            entry = loadout.load_spec(file).entries[0]
+            self.assertEqual(entry.url, "file:///home/saifr/Documents/lf/Basics.html#lab25")
+
     def test_browser_rejects_bad_scroll(self):
         with tempfile.TemporaryDirectory() as td:
             bad = ["120%", "55", "5 0%", True, -5]

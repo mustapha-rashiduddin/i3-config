@@ -245,11 +245,14 @@ def _parse_loadout_slots(path):
             auto += 1
         used.add(slot)
 
-    for item in data.get("terminal") or []:
-        add(item.get("slot") if isinstance(item, dict) else None)
-    emacs = data.get("emacs")
-    if isinstance(emacs, dict):
-        add(emacs.get("slot"))
+    for key, items in data.items():
+        if key == "emacs":
+            if isinstance(items, dict):
+                add(items.get("slot"))
+            continue
+        if key in ("terminal", "browser"):
+            for item in items or []:
+                add(item.get("slot") if isinstance(item, dict) else None)
     return used
 
 

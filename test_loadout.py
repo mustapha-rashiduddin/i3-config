@@ -164,6 +164,84 @@ name = "code"
                 with self.assertRaises(loadout.LoadoutError):
                     loadout.load_spec(file)
 
+    def test_browser_parses_url_name_and_scroll(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text('''
+[[browser]]
+slot = "j"
+url = "https://docs.python.org/3/library/functions.html"
+name = "python docs"
+scroll = "40%"
+''')
+            entry = loadout.load_spec(file).entries[0]
+            self.assertEqual(entry.kind, "browser")
+            self.assertEqual(entry.url, "https://docs.python.org/3/library/functions.html")
+            self.assertEqual(entry.name, "python docs")
+            self.assertEqual(entry.scroll, "40%")
+            self.assertEqual(entry.slot, "j")
+
+    def test_browser_name_defaults_to_host(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text('''
+[[browser]]
+url = "https://developer.mozilla.org/en-US/docs/Web/CSS"
+scroll = 800
+''')
+            entry = loadout.load_spec(file).entries[0]
+            self.assertEqual(entry.name, "developer.mozilla.org")
+            self.assertEqual(entry.scroll, 800)
+
+    def test_browser_requires_http_url(self):
+        with tempfile.TemporaryDirectory() as td:
+            for url in (None, "ftp://example.com", "javascript:alert(1)", ""):
+                file = Path(td) / "loadout"
+                file.write_text(f'''
+[[browser]]
+url = {None if url is None else '"%s"' % url}
+''')
+                with self.assertRaises(loadout.LoadoutError):
+                    loadout.load_spec(file)
+
+    def test_browser_rejects_bad_scroll(self):
+        with tempfile.TemporaryDirectory() as td:
+            bad = ["120%", "55", "5 0%", True, -5]
+            for scroll in bad:
+                file = Path(td) / "loadout"
+                rendered = "true" if scroll is True else repr(scroll)
+                file.write_text(f'''
+[[browser]]
+url = "https://example.com"
+scroll = {rendered}
+''')
+                with self.assertRaises(loadout.LoadoutError):
+                    loadout.load_spec(file)
+
+    def test_browser_slot_auto_assigns_in_declaration_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            file = Path(td) / "loadout"
+            file.write_text('''
+[[terminal]]
+name = "t0"
+
+[[browser]]
+url = "https://example.com"
+
+[emacs]
+
+[[terminal]]
+name = "t1"
+
+[[browser]]
+url = "https://example.org"
+''')
+            spec = loadout.load_spec(file)
+            self.assertEqual(
+                [(e.kind, e.slot) for e in spec.entries],
+                [("terminal", "j"), ("terminal", "k"), ("browser", "l"), ("browser", ";"), ("emacs", "m")],
+            )
+
 
 class PlanTests(unittest.TestCase):
     spec = None
@@ -305,6 +383,16 @@ class HelperTests(unittest.TestCase):
         expression = loadout.emacs_plant(Path('/tmp/a "quoted" dir'))
         self.assertIn("my/lock-workspace-to-dir", expression)
         self.assertIn('\\"quoted\\"', expression)
+
+    def test_browser_scroll_expr_pixels(self):
+        expression = loadout.browser_scroll_expr(420)
+        self.assertIn("r.scrollTop = 420", expression)
+        self.assertIn("want", expression)
+        self.assertIn("JSON.stringify", expression)
+
+    def test_browser_scroll_expr_percent(self):
+        expression = loadout.browser_scroll_expr("55%")
+        self.assertIn("max * 0.55", expression)
 
 
 class ActiveSpecTests(unittest.TestCase):
@@ -535,6 +623,39 @@ class HealTests(unittest.TestCase):
         unload.assert_called_once_with()
 
 
+class BrowserHealTests(unittest.TestCase):
+    def _win(self, cid, xid, ws, marks):
+        return loadout.Window(cid, xid, None, "t", ws, tuple(marks))
+
+    def _engage(self, spec, *wins):
+        patch.object(loadout, "get_tree", return_value={}).start()
+        patch.object(loadout, "windows", return_value=list(wins)).start()
+        patch.object(loadout, "active_spec", return_value=spec).start()
+        self.addCleanup(patch.stopall)
+
+    def _entry(self):
+        return loadout.Entry("browser:0", "browser", "m", "mozilla", Path("/tmp"),
+                             url="https://developer.mozilla.org", scroll="40%")
+
+    def test_browser_healthy_needs_no_label_or_plant(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        win = self._win(1, 100, "m", ("loadout:/tmp", "loadout-win:browser:0"))
+        with patch.object(loadout, "unload") as unload:
+            self._engage(spec, win)
+            self.assertEqual(loadout.heal(), 0)
+        unload.assert_not_called()
+
+    def test_missing_browser_window_unloads(self):
+        entry = self._entry()
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        beacon = self._win(2, 200, "m", ("loadout:/tmp",))
+        with patch.object(loadout, "unload") as unload:
+            self._engage(spec, beacon)
+            self.assertEqual(loadout.heal(), 1)
+        unload.assert_called_once_with()
+
+
 class EmacsLaunchTests(unittest.TestCase):
     def _entry(self) -> loadout.Entry:
         return loadout.Entry("emacs:0", "emacs", "l", "emacs", Path("/tmp"))
@@ -720,6 +841,62 @@ class TerminalLaunchTests(unittest.TestCase):
         self.assertFalse(any(c.startswith("workspace ") for c in commands), commands)
         self.assertTrue(any(f"move container to workspace {loadout.quote('j')}" in c for c in commands),
                         commands)
+
+
+class BrowserLaunchTests(unittest.TestCase):
+    def test_launch_opens_isolated_chrome_app_and_scrolls(self):
+        entry = loadout.Entry("browser:0", "browser", "m", "mozilla", Path("/tmp"),
+                              url="https://developer.mozilla.org/en-US/docs/Web/CSS", scroll="40%")
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        spawned = {}
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                spawned["argv"] = argv
+                spawned["cwd"] = kwargs.get("cwd")
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(loadout, "i3"), \
+             patch.object(loadout, "get_tree", return_value={}), \
+             patch.object(loadout.subprocess, "Popen", side_effect=FakePopen), \
+             patch.object(loadout, "wait_new_chrome",
+                          return_value=loadout.Window(1, 100, 123, "t", "m", ())), \
+             patch.object(loadout, "scroll_site") as scroll, \
+             patch.object(loadout, "rename_window"):
+            loadout.Controller(spec).launch(entry)
+        argv = spawned["argv"]
+        self.assertEqual(argv[0], loadout.BROWSER_BIN)
+        self.assertIn("--user-data-dir=" + str(loadout.CACHE_DIR / "chrome-browser_0"), argv)
+        self.assertIn("--remote-debugging-port=0", argv)
+        self.assertIn("--app=" + entry.url, argv)
+        self.assertEqual(spawned["cwd"], Path("/tmp"))
+        scroll.assert_called_once()
+
+    def test_launch_without_scroll_skips_scrolling(self):
+        entry = loadout.Entry("browser:0", "browser", "m", "mozilla", Path("/tmp"),
+                              url="https://example.com")
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(loadout, "i3"), \
+             patch.object(loadout, "get_tree", return_value={}), \
+             patch.object(loadout.subprocess, "Popen", side_effect=FakePopen), \
+             patch.object(loadout, "wait_new_chrome",
+                          return_value=loadout.Window(1, 100, 124, "t", "m", ())), \
+             patch.object(loadout, "scroll_site") as scroll, \
+             patch.object(loadout, "rename_window"):
+            loadout.Controller(spec).launch(entry)
+        scroll.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -19,13 +19,19 @@ Example loadout:
     path = "./src"
     emacs = true  # spawn st -e emacs -nw at that path, planted on it, no `o` needed
 
+    [[browser]]
+    url = "https://developer.mozilla.org/en-US/docs/Web/CSS"
+    scroll = "40%"   # open the page scrolled 40% down (or an integer pixel offset)
+    name = "css"     # optional; defaults to the URL host when omitted
+
     [emacs]
     path = "."
 
 Slots default to the first free row key in declaration order (j, k, l, ;,
-m, ,, ., /), so they can be omitted above. An explicit `slot` still wins:
-it must be one of the row keys, and the automatic scanner skips keys already
-taken by an explicit slot (or by an earlier automatic assignment).
+m, ,, ., /), shared across terminals, browsers and emacs, so they can be
+omitted above. An explicit `slot` still wins: it must be one of the row keys,
+and the automatic scanner skips keys already taken by an explicit slot (or by
+an earlier automatic assignment).
 
 Run directly as:
 
@@ -45,21 +51,28 @@ It finds the engaged loadout via the `loadout:<root>` marks left on the windows
 (the root is kept in i3's RAM, never written to a file), re-reads the TOML, and
 sweeps every entry: the managed window (its `loadout-win:<ident>` mark) must
 exist, sit on its slot, show its assigned name, and be anchored on its loadout
-directory. There is no repair — the first discrepancy unloads the loadout so
-every workspace button turns red; reload explicitly afterwards.
+directory (browser windows only need to exist on their slot — their content
+lives in the page). There is no repair — the first discrepancy unloads the
+loadout so every workspace button turns red; reload explicitly afterwards.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import errno
 import json
 import os
+import re
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
 import tomllib
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +84,8 @@ CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "i3
 STATE_FILE = CACHE_DIR / "state.json"
 RENAME_PIPE = Path.home() / ".config/i3/.rename_pipe"
 OVERLAY = Path.home() / ".config/i3/window_names.json"
+BROWSER_BIN = "google-chrome-stable"
+SCROLL_TIMEOUT = 10.0
 
 
 class LoadoutError(RuntimeError):
@@ -87,6 +102,8 @@ class Entry:
     command: tuple[str, ...] = ()
     script: str | None = None
     emacs: bool = False
+    url: str | None = None
+    scroll: int | str | None = None
 
     @property
     def mark(self) -> str:
@@ -209,10 +226,6 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
         raise LoadoutError(f"cannot read loadout: {exc}") from exc
 
     entries: list[Entry] = []
-    terminals = data.get("terminal", [])
-    if not isinstance(terminals, list):
-        raise LoadoutError("[[terminal]] must be an array of tables")
-
     used: set[str] = set()
     auto = 0
 
@@ -231,60 +244,103 @@ def load_spec(filename: str | os.PathLike[str]) -> Spec:
         used.add(slot)
         return slot
 
-    for n, item in enumerate(terminals):
-        if not isinstance(item, dict):
-            raise LoadoutError("each [[terminal]] entry must be a table")
-        slot = item.get("slot")
-        name = item.get("name")
+    def parse_browser(n: int, item: dict[str, Any]) -> Entry:
+        slot = assign(item.get("slot"), f"browser {n}")
+        url = item.get("url")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            raise LoadoutError(f"browser {n}: url must be an http(s) string")
+        name = item.get("name") or urllib.parse.urlsplit(url).hostname or url
         path = item.get("path", ".")
-        run_emacs = item.get("emacs", False)
-        if not isinstance(run_emacs, bool):
-            raise LoadoutError(f"terminal {n}: emacs must be a boolean")
-        slot = assign(slot, f"terminal {n}")
-        provided_command = "command" in item
-        command = item.get("command", ["st", "-e", "mksh"])
-        if run_emacs:
-            if provided_command:
-                raise LoadoutError(f"terminal {n}: emacs and command are mutually exclusive")
-            if "script" in item:
-                raise LoadoutError(f"terminal {n}: emacs and script are mutually exclusive")
-            command = ["st", "-e", "emacs", "-nw"]
+        scroll = item.get("scroll")
+        if scroll is not None:
+            if isinstance(scroll, bool) or not isinstance(scroll, (int, str)):
+                raise LoadoutError(
+                    f"browser {n}: scroll must be an integer (pixels) or a percent string like \"55%\"")
+            if isinstance(scroll, int) and scroll < 0:
+                raise LoadoutError(f"browser {n}: scroll must be >= 0")
+            if isinstance(scroll, str):
+                m = re.fullmatch(r"(\d{1,3})%", scroll.strip())
+                if m is None or int(m.group(1)) > 100:
+                    raise LoadoutError(
+                        f"browser {n}: scroll must be an integer (pixels) or a percent string like \"55%\"")
         if not isinstance(name, str) or not name.strip():
-            raise LoadoutError(f"terminal {n}: name is required")
+            raise LoadoutError(f"browser {n}: name is required")
         if not isinstance(path, str):
-            raise LoadoutError(f"terminal {n}: path must be a string")
-        if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
-            raise LoadoutError(f"terminal {n}: command must be a non-empty array of strings")
-        script = item.get("script")
-        if script is not None and not isinstance(script, str):
-            raise LoadoutError(f"terminal {n}: script must be a string")
-        entries.append(Entry(
-            ident=f"terminal:{n}",
-            kind="terminal",
+            raise LoadoutError(f"browser {n}: path must be a string")
+        return Entry(
+            ident=f"browser:{n}",
+            kind="browser",
             slot=slot,
             name=name.strip(),
             cwd=resolve_cwd(root, path),
-            command=tuple(command),
-            script=script,
-            emacs=run_emacs,
-        ))
+            url=url,
+            scroll=scroll,
+        )
 
-    emacs = data.get("emacs")
-    if emacs is not None:
-        if not isinstance(emacs, dict):
-            raise LoadoutError("[emacs] must be a table")
-        slot = emacs.get("slot")
-        path = emacs.get("path", ".")
-        name = emacs.get("name", "emacs")
-        slot = assign(slot, "emacs")
-        if not isinstance(path, str):
-            raise LoadoutError("emacs: path must be a string")
-        if not isinstance(name, str) or not name.strip():
-            raise LoadoutError("emacs: name must be a non-empty string")
-        entries.append(Entry("emacs:0", "emacs", slot, name.strip(), resolve_cwd(root, path)))
+    counts: dict[str, int] = {}
+    for key, items in data.items():
+        if key == "emacs":
+            if not isinstance(items, dict):
+                raise LoadoutError("[emacs] must be a table")
+            slot = items.get("slot")
+            path = items.get("path", ".")
+            name = items.get("name", "emacs")
+            slot = assign(slot, "emacs")
+            if not isinstance(path, str):
+                raise LoadoutError("emacs: path must be a string")
+            if not isinstance(name, str) or not name.strip():
+                raise LoadoutError("emacs: name must be a non-empty string")
+            entries.append(Entry("emacs:0", "emacs", slot, name.strip(), resolve_cwd(root, path)))
+            continue
+        if key not in ("terminal", "browser"):
+            continue
+        if not isinstance(items, list):
+            raise LoadoutError(f"[[{key}]] must be an array of tables")
+        for item in items:
+            n = counts.get(key, 0)
+            counts[key] = n + 1
+            if not isinstance(item, dict):
+                raise LoadoutError(f"each [[{key}]] entry must be a table")
+            if key == "browser":
+                entries.append(parse_browser(n, item))
+                continue
+            slot = item.get("slot")
+            name = item.get("name")
+            path = item.get("path", ".")
+            run_emacs = item.get("emacs", False)
+            if not isinstance(run_emacs, bool):
+                raise LoadoutError(f"terminal {n}: emacs must be a boolean")
+            slot = assign(slot, f"terminal {n}")
+            provided_command = "command" in item
+            command = item.get("command", ["st", "-e", "mksh"])
+            if run_emacs:
+                if provided_command:
+                    raise LoadoutError(f"terminal {n}: emacs and command are mutually exclusive")
+                if "script" in item:
+                    raise LoadoutError(f"terminal {n}: emacs and script are mutually exclusive")
+                command = ["st", "-e", "emacs", "-nw"]
+            if not isinstance(name, str) or not name.strip():
+                raise LoadoutError(f"terminal {n}: name is required")
+            if not isinstance(path, str):
+                raise LoadoutError(f"terminal {n}: path must be a string")
+            if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
+                raise LoadoutError(f"terminal {n}: command must be a non-empty array of strings")
+            script = item.get("script")
+            if script is not None and not isinstance(script, str):
+                raise LoadoutError(f"terminal {n}: script must be a string")
+            entries.append(Entry(
+                ident=f"terminal:{n}",
+                kind="terminal",
+                slot=slot,
+                name=name.strip(),
+                cwd=resolve_cwd(root, path),
+                command=tuple(command),
+                script=script,
+                emacs=run_emacs,
+            ))
 
     if not entries:
-        raise LoadoutError("loadout contains no [[terminal]] or [emacs] entries")
+        raise LoadoutError("loadout contains no [[terminal]], [[browser]] or [emacs] entries")
     return Spec(source, root, tuple(entries))
 
 
@@ -423,6 +479,200 @@ def wait_new(before: set[int], *, pid: int | None = None, title: str | None = No
             return new[0]
         time.sleep(0.05)
     raise LoadoutError("timed out waiting for application window")
+
+
+def wait_new_chrome(before: set[int], timeout: float = 25.0) -> Window:
+    """Wait for the Google Chrome window this launch created.
+
+    Chrome maps the app window a beat after the process exits, so watch the
+    tree for any node whose WM_CLASS is Google-chrome. Allowed longer than
+    wait_new: a brand-new profile pays for first-run setup.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for node, workspace in walk(get_tree()):
+            if node.get("window") is None or not workspace or workspace == "__i3_scratch":
+                continue
+            if node["id"] in before:
+                continue
+            if window_class(node).lower() == "google-chrome":
+                return window_from(node, workspace)
+        time.sleep(0.1)
+    raise LoadoutError("timed out waiting for a browser window")
+
+
+def browser_scroll_expr(scroll: int | str) -> str:
+    """JS for CDP Runtime.evaluate: scroll the page to the target depth.
+
+    A bare int is an absolute pixel offset; a string like "55%" is a fraction
+    of the scrollable height, which is what you normally want for reading text.
+    Returns JSON {top, want, max}: the scrollTop actually reached, the target
+    (clamped to the page height), and the scrollable height — the caller
+    retries until top == want on a non-empty page, so late-loading images that
+    grow the page converge on the right fraction.
+    """
+    target = str(scroll) if isinstance(scroll, int) else f"Math.round(max * {float(scroll.strip().rstrip('%')) / 100.0:g})"
+    return (
+        "(() => {"
+        "  const r = document.scrollingElement || document.documentElement;"
+        "  const max = r.scrollHeight - r.clientHeight;"
+        f"  r.scrollTop = {target};"
+        f"  const want = Math.min({target}, max);"
+        "  return JSON.stringify({top: r.scrollTop, want: want, max: max});"
+        "})()"
+    )
+
+
+def ws_connect(url: str, timeout: float = 3.0) -> tuple[socket.socket, bytes]:
+    """Upgrade a socket to a websocket client; returns (socket, leftover bytes)."""
+    key = base64.b64encode(os.urandom(16)).decode()
+    parts = urllib.parse.urlsplit(url)
+    sock = socket.create_connection((parts.hostname, parts.port), timeout=timeout)
+    request = (
+        f"GET {parts.path or '/'} HTTP/1.1\r\n"
+        f"Host: {parts.hostname}:{parts.port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    sock.sendall(request.encode())
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(512)
+        if not chunk:
+            break
+        data += chunk
+    if b" 101 " not in data.split(b"\r\n", 1)[0]:
+        raise ConnectionError("websocket handshake failed")
+    return sock, data.split(b"\r\n\r\n", 1)[1]
+
+
+def ws_send(sock: socket.socket, text: str) -> None:
+    """Send a masked text frame (the only kind a browser expects from a client)."""
+    payload = text.encode()
+    mask = os.urandom(4)
+    header = bytearray([0x81])
+    n = len(payload)
+    if n < 126:
+        header.append(0x80 | n)
+    elif n < 65536:
+        header += bytes((0x80 | 126,)) + struct.pack(">H", n)
+    else:
+        header += bytes((0x80 | 127,)) + struct.pack(">Q", n)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    sock.sendall(bytes(header) + mask + masked)
+
+
+def ws_read_message(sock: socket.socket, buf: bytes) -> tuple[str, bytes]:
+    """Read one complete message; returns (text, leftover bytes)."""
+    while True:
+        while len(buf) < 2:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("websocket closed")
+            buf += chunk
+        first, second = buf[0], buf[1]
+        length = second & 0x7F
+        idx = 2
+        if length == 126:
+            while len(buf) < 4:
+                buf += sock.recv(4096)
+            length = struct.unpack(">H", buf[2:4])[0]
+            idx = 4
+        elif length == 127:
+            while len(buf) < 10:
+                buf += sock.recv(4096)
+            length = struct.unpack(">Q", buf[2:10])[0]
+            idx = 10
+        masked = bool(second & 0x80)
+        mask = buf[idx:idx + 4] if masked else b""
+        if masked:
+            idx += 4
+        while len(buf) < idx + length:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("websocket closed")
+            buf += chunk
+        payload = buf[idx:idx + length]
+        buf = buf[idx + length:]
+        if masked:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        if first & 0x0F == 1 and first & 0x80:
+            return payload.decode(errors="replace"), buf
+
+
+def chrome_scroll(target_ws: str, expression: str) -> dict[str, Any] | None:
+    """Evaluate the scroll JS on the page and return its {top, want, max} JSON."""
+    try:
+        sock, buf = ws_connect(target_ws, timeout=3.0)
+        try:
+            sock.settimeout(3.0)
+            ws_send(sock, json.dumps({
+                "id": 1,
+                "method": "Runtime.evaluate",
+                "params": {"expression": expression, "returnByValue": True},
+            }))
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                message, buf = ws_read_message(sock, buf)
+                reply = json.loads(message)
+                if reply.get("id") == 1:
+                    value = reply.get("result", {}).get("result", {}).get("value")
+                    if isinstance(value, str):
+                        parsed = json.loads(value)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    return None
+            return None
+        finally:
+            sock.close()
+    except (OSError, ConnectionError, ValueError):
+        return None
+
+
+def scroll_site(profile: Path, entry: Entry) -> None:
+    """Scroll the freshly opened app window to the entry's depth, if any.
+
+    Chrome writes <profile>/DevToolsActivePort when started with
+    --remote-debugging-port=0; the port gates the DevTools HTTP + websocket
+    described by /json. This is best-effort: an unreachable page simply stays
+    at the top.
+    """
+    expression = browser_scroll_expr(entry.scroll)
+    if expression is None:
+        return
+    devtools = profile / "DevToolsActivePort"
+    port: str | None = None
+    deadline = time.monotonic() + SCROLL_TIMEOUT
+    while time.monotonic() < deadline:
+        if port is None:
+            try:
+                lines = devtools.read_text().splitlines()
+                if lines and lines[0].isdigit():
+                    port = lines[0]
+            except OSError:
+                pass
+        if port is not None:
+            try:
+                targets = json.loads(urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json", timeout=1.5).read())
+            except Exception:
+                targets = []
+            page = next((t for t in targets
+                         if t.get("type") == "page" and t.get("url") == entry.url
+                         and t.get("webSocketDebuggerUrl")), None)
+            if page is None:
+                page = next((t for t in targets
+                             if t.get("type") == "page" and t.get("webSocketDebuggerUrl")), None)
+            if page is not None:
+                state = chrome_scroll(page["webSocketDebuggerUrl"], expression)
+                if state is not None and state.get("max"):
+                    top = int(round(state.get("top") or 0))
+                    want = int(state.get("want") or 0)
+                    if abs(top - want) <= 2:
+                        return
+        time.sleep(0.4)
 
 
 def elisp_string(value: str) -> str:
@@ -617,6 +867,30 @@ class Controller:
             except FileNotFoundError as exc:
                 raise LoadoutError(f"terminal command not found: {command[0]}") from exc
             win = wait_new(before, pid=proc.pid, title=title)
+        elif entry.kind == "browser":
+            profile = CACHE_DIR / ("chrome-" + entry.ident.replace(":", "_"))
+            command = [
+                BROWSER_BIN,
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--remote-debugging-port=0",
+                "--app=" + entry.url,
+            ]
+            try:
+                subprocess.Popen(
+                    command,
+                    cwd=entry.cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as exc:
+                raise LoadoutError(f"browser command not found: {command[0]}") from exc
+            win = wait_new_chrome(before)
+            if entry.scroll is not None:
+                scroll_site(profile, entry)
         else:
             client = run(["emacsclient", "--eval", "t"], timeout=2.0)
             spawned: subprocess.Popen[bytes] | None = None
@@ -789,9 +1063,11 @@ def sweep_discrepancy(spec: Spec, present: dict[str, Window]) -> str | None:
     An entry is healthy when its managed window exists, sits on its own slot,
     shows its assigned name (terminals only; emacs is never renamed) and is
     anchored on its loadout directory — the terminal shell's cwd, or the
-    emacs plant and the speed-dial database. A terminal whose cwd cannot be
-    inspected is assumed fine. The sweep reports the first failing entry and
-    stops; `heal` unloads on exactly that signal.
+    emacs plant and the speed-dial database. Browser entries carry their
+    content (url, scroll) inside the page, so a live window on its slot is
+    enough. A terminal whose cwd cannot be inspected is assumed fine. The
+    sweep reports the first failing entry and stops; `heal` unloads on
+    exactly that signal.
     """
     overlay = read_overlay()
     for entry in spec.entries:
@@ -812,6 +1088,8 @@ def sweep_discrepancy(spec: Spec, present: dict[str, Window]) -> str | None:
             cwd = terminal_cwd(win)
             if cwd is not None and os.path.realpath(cwd) != os.path.realpath(entry.cwd):
                 return f"terminal {entry.ident}: cwd {cwd}, expected {entry.cwd}"
+        elif entry.kind == "browser":
+            continue
         elif not emacs_plant_matches(entry.cwd):
             return f"emacs {entry.ident}: planted elsewhere"
         else:

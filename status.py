@@ -32,13 +32,22 @@ def run(cmd, timeout=3):
         return ""
 
 
-def _has_loadout_mark(node):
-    if node.get("marks") and any(m.startswith(LOADOUT_MARK) for m in node["marks"]):
-        return True
+def _loadout_lock_root(node):
+    if node.get("marks"):
+        for m in node["marks"]:
+            if m.startswith(LOADOUT_MARK):
+                root = m[len(LOADOUT_MARK):]
+                if root:
+                    return root
     for child in node.get("nodes", []) + node.get("floating_nodes", []):
-        if _has_loadout_mark(child):
-            return True
-    return False
+        root = _loadout_lock_root(child)
+        if root:
+            return root
+    return None
+
+
+def _has_loadout_mark(node):
+    return _loadout_lock_root(node) is not None
 
 
 def planted_db_root():
@@ -52,20 +61,21 @@ def planted_db_root():
 
 
 def load_state():
-    """LOCKED when a window carries a loadout mark; UNLOCKED when the speed-dial
-    plant points at a loadout file that is not engaged; N/A otherwise."""
+    """(state, root) — LOCKED with the engaged loadout mark's directory, or
+    UNLOCKED with the planted loadout directory, or "N/A" without a root."""
     try:
         tree = json.loads(run(["i3-msg", "-t", "get_tree"]))
     except Exception:
-        tree = {}
-    if _has_loadout_mark(tree):
-        return "LOCKED"
+        return "N/A", None
+    root = _loadout_lock_root(tree)
+    if root is not None:
+        return "LOCKED", root
     root = planted_db_root()
     if root is None:
-        return "N/A"
+        return "N/A", None
     if (root / "loadout").is_file() or (root / "loadout.toml").is_file():
-        return "UNLOCKED"
-    return "N/A"
+        return "UNLOCKED", root
+    return "N/A", None
 
 
 def vol_block():
@@ -200,8 +210,9 @@ def main():
 
     def emit():
         nonlocal first
-        color = "#00ff00" if state == "LOCKED" else "#ff5252"
-        state_block = {"full_text": state, "color": color}
+        color = "#00ff00" if state[0] == "LOCKED" else "#ff5252"
+        text = f"{state[1]} {state[0].lower()}" if state[1] else "N/A"
+        state_block = {"full_text": text, "color": color}
         blocks = [state_block]
         on_second = int(time.time()) % 2
         cap = bat_percent()

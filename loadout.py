@@ -209,6 +209,14 @@ def focused_workspace(tree: dict[str, Any]) -> str | None:
     return None
 
 
+def focused_window(tree: dict[str, Any]) -> Window | None:
+    for node, workspace in walk(tree):
+        if (node.get("focused") and node.get("window") is not None
+                and workspace and workspace != "__i3_scratch"):
+            return window_from(node, workspace)
+    return None
+
+
 def resolve_cwd(root: Path, value: str) -> Path:
     path = Path(os.path.expandvars(value)).expanduser()
     if not path.is_absolute():
@@ -1204,6 +1212,166 @@ def elisp_string(value: str) -> str:
     return json.dumps(value)
 
 
+def save_scroll() -> int:
+    """Capture the focused loadout browser's scroll and offer to save it.
+
+    The heavy lookups run first; dmenu is spawned only after the proposed
+    percentage is known. Writing is skipped unless the dmenu answer is yes.
+    """
+    tree = get_tree()
+    win = focused_window(tree)
+    if win is None:
+        print("loadout: no focused window", file=sys.stderr)
+        return 1
+    ident = next((mark[len(WINDOW_MARK_PREFIX):] for mark in win.marks
+                  if mark.startswith(WINDOW_MARK_PREFIX)), None)
+    if not ident or not ident.startswith("browser:"):
+        print("loadout: focused window is not a loadout browser", file=sys.stderr)
+        return 1
+    spec = active_spec()
+    if spec is None:
+        print("loadout: no engaged loadout", file=sys.stderr)
+        return 1
+    entry = next((e for e in spec.entries if e.ident == ident), None)
+    if entry is None or entry.kind != "browser":
+        print(f"loadout: no loadout browser entry {ident!r}", file=sys.stderr)
+        return 1
+    browser_number = int(ident.split(":", 1)[1])
+    percent = page_scroll_percent(
+        CACHE_DIR / ("chrome-" + ident.replace(":", "_")), entry)
+    prompt = f"Save scroll = {percent}% in {spec.source.name}?"
+    try:
+        choice = subprocess.run(
+            ["dmenu", "-p", prompt], input="No\nYes", text=True,
+            capture_output=True, timeout=30.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return 1
+    if choice.stdout.strip().lower() not in {"y", "yes"}:
+        return 0
+    rewrite_scroll(spec.source, browser_number, percent)
+    print(f"loadout: saved scroll = {percent}% in {spec.source}")
+    return 0
+
+
+def page_scroll_percent(profile: Path, entry: Entry) -> int:
+    """Return the focused browser page's scroll as a rounded percentage.
+
+    Reads the profile's DevToolsActivePort for a live --remote-debugging-port=0
+    port, then asks the page for {y: scrollY, max: scrollable height}. A page
+    that cannot scroll reports 0%.
+    """
+    try:
+        lines = (profile / "DevToolsActivePort").read_text().splitlines()
+    except OSError as exc:
+        raise LoadoutError("browser DevTools port unavailable") from exc
+    if not lines or not lines[0].isdigit():
+        raise LoadoutError("browser DevTools port unavailable")
+    port = lines[0]
+    try:
+        targets = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json", timeout=1.5).read())
+    except (OSError, ConnectionError, ValueError) as exc:
+        raise LoadoutError("could not enumerate browser pages") from exc
+    page = next((t for t in targets
+                 if t.get("type") == "page" and t.get("url") == entry.url
+                 and t.get("webSocketDebuggerUrl")), None)
+    if page is None:
+        page = next((t for t in targets
+                     if t.get("type") == "page" and t.get("webSocketDebuggerUrl")), None)
+    if page is None:
+        raise LoadoutError("no browser page found")
+    sock: socket.socket | None = None
+    try:
+        sock, buf = ws_connect(page["webSocketDebuggerUrl"])
+        result, _ = cdp_request(
+            sock,
+            buf,
+            1,
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "(() => {"
+                    "  const r = document.scrollingElement || document.documentElement;"
+                    "  return {y: window.scrollY, max: r.scrollHeight - r.clientHeight};"
+                    "})()"
+                ),
+                "returnByValue": True,
+            },
+        )
+        value = result.get("result", {}).get("value")
+        if not isinstance(value, dict):
+            raise LoadoutError("browser returned no scroll position")
+        y = value.get("y")
+        max_height = value.get("max")
+        if not isinstance(y, (int, float)) or not isinstance(max_height, (int, float)):
+            raise LoadoutError("browser returned an invalid scroll position")
+        if max_height <= 0:
+            return 0
+        return max(0, min(100, int(round(100 * y / max_height))))
+    except (OSError, ConnectionError, ValueError) as exc:
+        raise LoadoutError("could not read browser scroll position") from exc
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def rewrite_scroll(path: Path, browser_number: int, percent: int) -> None:
+    """Set `scroll = "N%"` on the browser_numberth [[browser]] block.
+
+    Edits only the one block's `scroll` line (or inserts one right after its
+    `url` line), preserving every other line, comment, and blank verbatim. The
+    file is replaced atomically in the same directory so inotify-based watchers
+    still fire (IN_MOVED_TO), and the result is re-parsed to guarantee a valid
+    loadout.
+    """
+    try:
+        original = path.read_text()
+    except OSError as exc:
+        raise LoadoutError(f"could not read {path}") from exc
+    lines = original.splitlines()
+    block_start: int | None = None
+    browser_index = 0
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*\[\[browser\]\]", line):
+            if browser_index == browser_number:
+                block_start = i
+                break
+            browser_index += 1
+    if block_start is None:
+        raise LoadoutError(f"no [[browser]] #{browser_number} in {path}")
+    block_end = block_start + 1
+    while block_end < len(lines) and not re.match(r"^\s*\[", lines[block_end]):
+        block_end += 1
+    scroll_index: int | None = None
+    url_index: int | None = None
+    for i in range(block_start, block_end):
+        if scroll_index is None and re.match(r"^\s*scroll\s*=", lines[i]):
+            scroll_index = i
+        if url_index is None and re.match(r"^\s*url\s*=", lines[i]):
+            url_index = i
+    value = f'scroll = "{percent}%"'
+    if scroll_index is not None:
+        indent = re.match(r"^\s*", lines[scroll_index]).group(0)
+        lines[scroll_index] = f"{indent}{value}"
+    else:
+        target = url_index if url_index is not None else block_start
+        indent = re.match(r"^\s*", lines[target]).group(0)
+        lines.insert(target + 1, f"{indent}{value}")
+    rewritten = "\n".join(lines) + ("\n" if original.endswith("\n") else "")
+    try:
+        path.write_text(rewritten)
+    except OSError as exc:
+        raise LoadoutError(f"could not write {path}") from exc
+    try:
+        load_spec(path)
+    except LoadoutError:
+        try:
+            path.write_text(original)
+        except OSError:
+            pass
+        raise LoadoutError(f"rejected scroll line would corrupt {path}")
+
+
 def emacs_plant(path: Path) -> str:
     return f"(my/lock-workspace-to-dir {elisp_string(str(path))})"
 
@@ -1683,6 +1851,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_chrome_theme = sub.add_parser("chrome-theme")
     p_chrome_theme.add_argument("theme", choices=("light", "dark"))
     p_heal = sub.add_parser("heal")
+    sub.add_parser("save-scroll")
     p_occ = sub.add_parser("_occupied", help=argparse.SUPPRESS)
     p_occ.add_argument("file")
     p_emacs = sub.add_parser("_emacs_path", help=argparse.SUPPRESS)
@@ -1717,6 +1886,8 @@ def main(argv: list[str] | None = None) -> int:
             return chrome_theme(args.theme)
         if args.subcommand == "heal":
             return heal()
+        if args.subcommand == "save-scroll":
+            return save_scroll()
         if args.subcommand == "_occupied":
             spec = load_spec(args.file)
             _, leftover = plan(spec, get_tree())

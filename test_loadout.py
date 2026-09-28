@@ -1232,5 +1232,217 @@ class DarkReaderTests(unittest.TestCase):
         set_theme.assert_any_call(second, False)
 
 
+class SaveScrollTests(unittest.TestCase):
+    def _focused_tree(self):
+        return {
+            "type": "root",
+            "nodes": [
+                {"type": "workspace", "name": "j", "nodes": [
+                    {"id": 1, "window": 100, "pid": 1, "name": "Basics",
+                     "focused": True,
+                     "marks": ("loadout:/tmp/root", "loadout-win:browser:0")},
+                ]},
+                {"type": "workspace", "name": "__i3_scratch", "nodes": [
+                    {"id": 2, "window": 200, "focused": True},
+                ]},
+            ],
+        }
+
+    def test_focused_window_skips_scratch(self):
+        win = loadout.focused_window(self._focused_tree())
+        self.assertIsNotNone(win)
+        self.assertEqual(win.con_id, 1)
+        self.assertEqual(win.workspace, "j")
+
+    def test_focused_window_none_without_focus(self):
+        tree = {"type": "root", "nodes": [
+            {"type": "workspace", "name": "j", "nodes": [
+                {"id": 1, "window": 100, "focused": False},
+            ]},
+        ]}
+        self.assertIsNone(loadout.focused_window(tree))
+
+    def test_window_loadout_ident_from_marks(self):
+        win = loadout.Window(1, 100, None, "x", "j", ("loadout-win:browser:0",))
+        ident = next((m[len(loadout.WINDOW_MARK_PREFIX):] for m in win.marks
+                      if m.startswith(loadout.WINDOW_MARK_PREFIX)), None)
+        self.assertEqual(ident, "browser:0")
+
+    def test_window_loadout_ident_none_without_marks(self):
+        win = loadout.Window(1, 100, None, "x", "j", ())
+        ident = next((m[len(loadout.WINDOW_MARK_PREFIX):] for m in win.marks
+                      if m.startswith(loadout.WINDOW_MARK_PREFIX)), None)
+        self.assertIsNone(ident)
+
+    def _scroll_response(self, y, max_height):
+        response = types.SimpleNamespace(read=lambda: json.dumps([
+            {"type": "page", "url": "file:///tmp/doc.html",
+             "webSocketDebuggerUrl": "ws://target"}]).encode())
+
+        class FakeSocket:
+            def close(self):
+                pass
+
+        socket = FakeSocket()
+
+        def request(sock, buf, request_id, method, params=None, **kwargs):
+            return {"result": {"value": {"y": y, "max": max_height}}}, b""
+
+        return response, socket, request
+
+    def test_page_scroll_percent_rounds_up(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            (profile / "DevToolsActivePort").write_text("9222\n/devtools/browser/x\n")
+            entry = loadout.Entry("browser:0", "browser", "j", "doc",
+                                  Path(td), url="file:///tmp/doc.html")
+            response, fake_socket, request = self._scroll_response(1234, 3000)
+            with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+                 patch.object(loadout, "ws_connect",
+                              return_value=(fake_socket, b"")), \
+                 patch.object(loadout, "cdp_request", side_effect=request):
+                self.assertEqual(loadout.page_scroll_percent(profile, entry), 41)
+
+    def test_page_scroll_percent_clamps_to_100(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            (profile / "DevToolsActivePort").write_text("9222\n")
+            entry = loadout.Entry("browser:0", "browser", "j", "doc",
+                                  Path(td), url="file:///tmp/doc.html")
+            response, fake_socket, request = self._scroll_response(3500, 3000)
+            with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+                 patch.object(loadout, "ws_connect",
+                              return_value=(fake_socket, b"")), \
+                 patch.object(loadout, "cdp_request", side_effect=request):
+                self.assertEqual(loadout.page_scroll_percent(profile, entry), 100)
+
+    def test_page_scroll_percent_zero_when_not_scrollable(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            (profile / "DevToolsActivePort").write_text("9222\n")
+            entry = loadout.Entry("browser:0", "browser", "j", "doc",
+                                  Path(td), url="file:///tmp/doc.html")
+            response, fake_socket, request = self._scroll_response(0, 0)
+            with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+                 patch.object(loadout, "ws_connect",
+                              return_value=(fake_socket, b"")), \
+                 patch.object(loadout, "cdp_request", side_effect=request):
+                self.assertEqual(loadout.page_scroll_percent(profile, entry), 0)
+
+    def test_page_scroll_percent_requires_live_port(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            with self.assertRaises(loadout.LoadoutError):
+                loadout.page_scroll_percent(
+                    profile,
+                    loadout.Entry("browser:0", "browser", "j", "doc", Path(td)))
+
+    def test_rewrite_scroll_replaces_existing_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "loadout"
+            path.write_text('''# a comment
+[[browser]]
+url = "file:///tmp/doc.html"
+name = "doc"
+scroll = "10%"
+
+[[terminal]]
+name = "sql"
+''')
+            loadout.rewrite_scroll(path, 0, 62)
+            text = path.read_text()
+            self.assertIn('scroll = "62%"', text)
+            self.assertNotIn('scroll = "10%"', text)
+            self.assertTrue(text.startswith("# a comment\n[[browser]]\nurl"))
+
+    def test_rewrite_scroll_inserts_after_url(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "loadout"
+            path.write_text('''[[browser]]
+url = "file:///tmp/doc.html"
+name = "doc"
+
+[[terminal]]
+name = "sql"
+''')
+            loadout.rewrite_scroll(path, 0, 40)
+            self.assertIn('url = "file:///tmp/doc.html"\nscroll = "40%"', path.read_text())
+            self.assertTrue(loadout.load_spec(path).entries[0].scroll == "40%")
+
+    def test_rewrite_scroll_targets_second_browser_block(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "loadout"
+            path.write_text('''[[browser]]
+url = "https://example.com"
+name = "first"
+
+[[terminal]]
+slot = "j"
+name = "sql"
+
+[[browser]]
+url = "file:///tmp/doc.html"
+name = "doc"
+''')
+            loadout.rewrite_scroll(path, 1, 33)
+            text = path.read_text()
+            self.assertNotIn("scroll = \"33%\"", text.split("[[browser]]")[1])
+            self.assertIn('file:///tmp/doc.html"\nscroll = "33%"', text)
+            entries = loadout.load_spec(path).entries
+            self.assertEqual(entries[0].scroll, None)
+            self.assertEqual(entries[1].scroll, "33%")
+
+    def _save_flow(self, answer, ident="browser:0", focused=True):
+        root = Path(tempfile.mkdtemp())
+        (root / "loadout").write_text("[[browser]]\nurl = \"file:///tmp/doc.html\"\nname = \"doc\"\n")
+        win = loadout.Window(1, 100, None, "doc", "j",
+                             (f"loadout:{root}", f"loadout-win:{ident}"))
+        spec = loadout.load_spec(root / "loadout")
+        return win, spec, root
+
+    def _tree_with(self, win):
+        return {"type": "root", "nodes": [
+            {"type": "workspace", "name": "j", "nodes": [
+                {"id": win.con_id, "window": 100, "focused": True,
+                 "marks": win.marks},
+            ]},
+        ]}
+
+    def test_save_scroll_yes_rewrites_file(self):
+        win, spec, root = self._save_flow("yes")
+        with patch.object(loadout, "get_tree", return_value=self._tree_with(win)), \
+             patch.object(loadout, "active_spec", return_value=spec), \
+             patch.object(loadout, "page_scroll_percent", return_value=55), \
+             patch.object(loadout.subprocess, "run") as run, \
+             patch.object(loadout, "rewrite_scroll") as rewrite:
+            run.return_value.stdout = "yes"
+            code = loadout.save_scroll()
+        self.assertEqual(code, 0)
+        rewrite.assert_called_once_with(spec.source, 0, 55)
+
+    def test_save_scroll_no_skips_write(self):
+        win, spec, root = self._save_flow("no")
+        with patch.object(loadout, "get_tree", return_value=self._tree_with(win)), \
+             patch.object(loadout, "active_spec", return_value=spec), \
+             patch.object(loadout, "page_scroll_percent", return_value=55), \
+             patch.object(loadout.subprocess, "run") as run, \
+             patch.object(loadout, "rewrite_scroll") as rewrite:
+            run.return_value.stdout = "n"
+            code = loadout.save_scroll()
+        self.assertEqual(code, 0)
+        rewrite.assert_not_called()
+
+    def test_save_scroll_rejects_non_browser_window(self):
+        win, spec, root = self._save_flow("yes", ident="terminal:0", focused=False)
+        with patch.object(loadout, "get_tree", return_value=self._tree_with(win)), \
+             patch.object(loadout, "active_spec", return_value=spec), \
+             patch.object(loadout, "rewrite_scroll") as rewrite, \
+             patch.object(loadout.subprocess, "run") as run:
+            code = loadout.save_scroll()
+        self.assertEqual(code, 1)
+        rewrite.assert_not_called()
+        run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

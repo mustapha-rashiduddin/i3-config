@@ -1,3 +1,4 @@
+import json
 import tempfile
 import types
 import unittest
@@ -859,6 +860,7 @@ class BrowserLaunchTests(unittest.TestCase):
                               url="https://developer.mozilla.org/en-US/docs/Web/CSS", scroll="40%")
         spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
         spawned = {}
+        events = []
 
         class FakePopen:
             def __init__(self, argv, **kwargs):
@@ -869,11 +871,21 @@ class BrowserLaunchTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
+        def wait_for_browser(*args, **kwargs):
+            events.append("wait")
+            return loadout.Window(1, 100, 123, "t", "m", ())
+
+        def ensure_dark_reader(*args, **kwargs):
+            events.append("ensure")
+            return True
+
         with patch.object(loadout, "i3"), \
              patch.object(loadout, "get_tree", return_value={}), \
              patch.object(loadout.subprocess, "Popen", side_effect=FakePopen), \
-             patch.object(loadout, "wait_new_chrome",
-                          return_value=loadout.Window(1, 100, 123, "t", "m", ())), \
+             patch.object(loadout, "ensure_dark_reader_file_access",
+                          side_effect=ensure_dark_reader) as ensure, \
+             patch.object(loadout, "apply_current_chrome_theme") as apply_theme, \
+             patch.object(loadout, "wait_new_chrome", side_effect=wait_for_browser) as wait, \
              patch.object(loadout, "scroll_site") as scroll, \
              patch.object(loadout, "rename_window"):
             loadout.Controller(spec).launch(entry)
@@ -881,8 +893,15 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertEqual(argv[0], loadout.BROWSER_BIN)
         self.assertIn("--user-data-dir=" + str(loadout.CACHE_DIR / "chrome-browser_0"), argv)
         self.assertIn("--remote-debugging-port=0", argv)
+        self.assertIn("--allow-file-access-from-files", argv)
+        self.assertIn("--class=loadout-browser-0", argv)
         self.assertIn("--app=" + entry.url, argv)
         self.assertEqual(spawned["cwd"], Path("/tmp"))
+        wait.assert_called_once_with(set(), "loadout-browser-0")
+        ensure.assert_called_once_with(
+            loadout.CACHE_DIR / "chrome-browser_0", wait=True, intended_url=entry.url)
+        self.assertEqual(events, ["wait", "ensure"])
+        apply_theme.assert_called_once_with(loadout.CACHE_DIR / "chrome-browser_0")
         scroll.assert_called_once()
 
     def test_launch_without_scroll_skips_scrolling(self):
@@ -901,12 +920,316 @@ class BrowserLaunchTests(unittest.TestCase):
         with patch.object(loadout, "i3"), \
              patch.object(loadout, "get_tree", return_value={}), \
              patch.object(loadout.subprocess, "Popen", side_effect=FakePopen), \
+             patch.object(loadout, "ensure_dark_reader_file_access", return_value=True), \
+             patch.object(loadout, "apply_current_chrome_theme"), \
              patch.object(loadout, "wait_new_chrome",
                           return_value=loadout.Window(1, 100, 124, "t", "m", ())), \
              patch.object(loadout, "scroll_site") as scroll, \
              patch.object(loadout, "rename_window"):
             loadout.Controller(spec).launch(entry)
         scroll.assert_not_called()
+
+    def test_wait_new_chrome_selects_matching_app_not_help_window(self):
+        expected = "loadout-browser-0"
+        nodes = [
+            ({
+                "id": 2,
+                "window": 102,
+                "name": "Help - Dark Reader",
+                "window_properties": {"class": expected, "window_role": "browser"},
+            }, "m"),
+            ({
+                "id": 3,
+                "window": 103,
+                "name": "Local documentation",
+                "window_properties": {"class": expected, "window_role": "pop-up"},
+            }, "j"),
+        ]
+        with patch.object(loadout, "get_tree", return_value={}), \
+             patch.object(loadout, "walk", return_value=nodes):
+            win = loadout.wait_new_chrome(set(), expected, timeout=0.1)
+        self.assertEqual(win.con_id, 3)
+
+    def test_launch_stops_browser_when_dark_reader_setup_fails(self):
+        entry = loadout.Entry("browser:0", "browser", "m", "mozilla", Path("/tmp"),
+                              url="https://example.com")
+        spec = loadout.Spec(Path("/tmp/loadout"), Path("/tmp"), (entry,))
+        proc = types.SimpleNamespace()
+        with patch.object(loadout, "get_tree", return_value={}), \
+             patch.object(loadout.subprocess, "Popen", return_value=proc), \
+             patch.object(loadout, "wait_new_chrome",
+                          return_value=loadout.Window(1, 100, 123, "t", "m", ())), \
+             patch.object(loadout, "ensure_dark_reader_file_access", return_value=False), \
+             patch.object(loadout, "stop_process") as stop:
+            with self.assertRaisesRegex(loadout.LoadoutError, "configure Dark Reader"):
+                loadout.Controller(spec).launch(entry)
+        stop.assert_called_once_with(proc)
+
+
+class DarkReaderTests(unittest.TestCase):
+    def test_reload_file_page_waits_for_new_loader_and_restores_xy(self):
+        target = {
+            "type": "page",
+            "url": "file:///tmp/doc.html#section",
+            "webSocketDebuggerUrl": "ws://target",
+        }
+        response = types.SimpleNamespace(read=lambda: json.dumps([target]).encode())
+        requests = []
+        frame_reads = 0
+
+        class FakeSocket:
+            def close(self):
+                pass
+
+        def request(sock, buf, request_id, method, params=None, **kwargs):
+            nonlocal frame_reads
+            requests.append((method, params))
+            if method == "Runtime.evaluate":
+                expression = params["expression"]
+                if expression.startswith("({x:"):
+                    return {"result": {"value": {"x": 17, "y": 2500}}}, b""
+                if expression.startswith("({ready:"):
+                    return {"result": {"value": {"ready": True, "active": True}}}, b""
+                return {}, b""
+            if method == "Page.getFrameTree":
+                frame_reads += 1
+                loader = "new" if frame_reads >= 3 else "old"
+                return {"frameTree": {"frame": {"loaderId": loader}}}, b""
+            return {}, b""
+
+        with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+             patch.object(loadout, "ws_connect", return_value=(FakeSocket(), b"")), \
+             patch.object(loadout, "cdp_request", side_effect=request), \
+             patch.object(loadout.time, "sleep"):
+            loadout.reload_file_pages("9222", True)
+
+        self.assertEqual([method for method, _ in requests], [
+            "Runtime.evaluate",
+            "Page.getFrameTree",
+            "Page.reload",
+            "Page.getFrameTree",
+            "Page.getFrameTree",
+            "Runtime.evaluate",
+            "Runtime.evaluate",
+        ])
+        self.assertEqual(requests[-1][1]["expression"], "window.scrollTo(17, 2500)")
+
+    def test_reload_file_page_reports_setup_reload_failure(self):
+        target = {
+            "type": "page",
+            "url": "file:///tmp/doc.html",
+            "webSocketDebuggerUrl": "ws://target",
+        }
+        response = types.SimpleNamespace(read=lambda: json.dumps([target]).encode())
+
+        class FakeSocket:
+            def close(self):
+                pass
+
+        def request(sock, buf, request_id, method, params=None, **kwargs):
+            if method == "Runtime.evaluate":
+                return {"result": {"value": {"x": 0, "y": 10}}}, b""
+            if method == "Page.getFrameTree":
+                return {"frameTree": {"frame": {"loaderId": "old"}}}, b""
+            raise loadout.LoadoutError("reload failed")
+
+        with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+             patch.object(loadout, "ws_connect", return_value=(FakeSocket(), b"")), \
+             patch.object(loadout, "cdp_request", side_effect=request):
+            with self.assertRaisesRegex(
+                    loadout.LoadoutError, "did not finish reloading file:///tmp/doc.html"):
+                loadout.reload_file_pages("9222")
+
+    def test_file_access_updates_when_supported_but_inactive(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            (profile / "DevToolsActivePort").write_text(
+                "9222\n/devtools/browser/test\n")
+            requests = []
+
+            class FakeSocket:
+                def __init__(self, name):
+                    self.name = name
+
+                def close(self):
+                    pass
+
+            def request(sock, buf, request_id, method, params=None, **kwargs):
+                requests.append((sock.name, method, params, kwargs))
+                if method == "Target.createTarget":
+                    return {"targetId": "target"}, b""
+                if method == "Runtime.evaluate":
+                    return {"result": {"value": {"changed": True}}}, b""
+                return {}, b""
+
+            sockets = [(FakeSocket("browser"), b""), (FakeSocket("target"), b"")]
+            with patch.object(loadout, "ws_connect", side_effect=sockets), \
+                 patch.object(loadout, "cdp_request", side_effect=request), \
+                 patch.object(loadout, "reload_file_pages") as reload:
+                self.assertTrue(loadout.ensure_dark_reader_file_access(profile))
+
+        evaluate = next(request for request in requests
+                        if request[1] == "Runtime.evaluate")
+        expression = evaluate[2]["expression"]
+        self.assertIn("before.fileAccess?.isActive !== true", expression)
+        self.assertIn("before.state !== \"ENABLED\"", expression)
+        self.assertIn("chrome.management.setEnabled(id, true", expression)
+        reload.assert_called_once_with("9222")
+
+    def test_first_install_cleanup_preserves_intended_page_and_settings_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            (profile / "DevToolsActivePort").write_text(
+                "9222\n/devtools/browser/test\n")
+            closed = []
+            targets = [
+                {
+                    "type": "page",
+                    "id": "welcome",
+                    "url": "https://darkreader.org/help/",
+                },
+                {
+                    "type": "page",
+                    "id": "other",
+                    "url": "https://example.com/",
+                },
+                {
+                    "type": "page",
+                    "id": "intended",
+                    "url": "https://darkreader.org/help/en/",
+                },
+            ]
+            response = types.SimpleNamespace(read=lambda: json.dumps(targets).encode())
+
+            class FakeSocket:
+                def close(self):
+                    pass
+
+            def request(sock, buf, request_id, method, params=None, **kwargs):
+                if method == "Target.createTarget":
+                    return {"targetId": "settings"}, b""
+                if method == "Runtime.evaluate":
+                    return {"result": {"value": {"changed": True}}}, b""
+                if method == "Target.closeTarget":
+                    closed.append(params["targetId"])
+                return {}, b""
+
+            with patch.object(loadout, "ws_connect",
+                              side_effect=[(FakeSocket(), b""), (FakeSocket(), b"")]), \
+                 patch.object(loadout, "cdp_request", side_effect=request), \
+                 patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+                 patch.object(loadout, "reload_file_pages") as reload:
+                self.assertTrue(loadout.ensure_dark_reader_file_access(
+                    profile,
+                    wait=True,
+                    intended_url="https://darkreader.org/help/en/#install",
+                ))
+
+        self.assertEqual(closed, ["welcome", "settings"])
+        reload.assert_called_once_with("9222")
+
+    def test_expression_sets_master_state_dark_mode_and_disables_automation(self):
+        expression = loadout.dark_reader_expression(False)
+        self.assertIn("const wanted = false", expression)
+        self.assertIn("local.syncSettings === false", expression)
+        self.assertIn("...(before.automation || {}), enabled: false", expression)
+        self.assertIn('...(before.theme || {}), mode: 1, engine: "dynamicTheme"', expression)
+        self.assertIn("await area.set", expression)
+        self.assertIn("stored.enabled === wanted", expression)
+        self.assertIn("stored.theme?.mode === 1", expression)
+        self.assertIn('stored.theme?.engine === "dynamicTheme"', expression)
+
+    def test_set_theme_uses_existing_worker_and_creates_no_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            (profile / "DevToolsActivePort").write_text("9222\n/devtools/browser/test\n")
+            targets = [
+                {
+                    "id": "page",
+                    "type": "page",
+                    "url": "file:///tmp/doc.html",
+                    "webSocketDebuggerUrl": "ws://page",
+                },
+                {
+                    "id": "worker",
+                    "type": "service_worker",
+                    "url": f"chrome-extension://{loadout.DARK_READER_ID}/background/index.js",
+                    "webSocketDebuggerUrl": "ws://worker",
+                },
+            ]
+            response = types.SimpleNamespace(read=lambda: json.dumps(targets).encode())
+            requests = []
+            events = []
+            positions = {"page": (17, 2500)}
+
+            class FakeSocket:
+                def __init__(self, name):
+                    self.name = name
+
+                def close(self):
+                    pass
+
+            def request(sock, buf, request_id, method, params=None, **kwargs):
+                requests.append((sock.name, method, params, kwargs))
+                if method == "Runtime.evaluate":
+                    events.append("change")
+                    return {"result": {"value": {
+                        "enabled": True,
+                        "automationEnabled": False,
+                        "mode": 1,
+                        "engine": "dynamicTheme",
+                    }}}, b""
+                if method == "Target.closeTarget":
+                    return {"success": True}, b""
+                return {}, b""
+
+            def capture(port, **kwargs):
+                events.append("capture")
+                return positions
+
+            sockets = [
+                (FakeSocket("probe"), b""),
+                (FakeSocket("page"), b""),
+                (FakeSocket("worker"), b""),
+                (FakeSocket("browser"), b""),
+            ]
+            with patch.object(loadout, "ws_connect", side_effect=sockets), \
+                 patch.object(loadout, "cdp_request", side_effect=request), \
+                 patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+                 patch.object(loadout, "file_page_scroll_positions", side_effect=capture), \
+                 patch.object(loadout, "reload_file_pages") as reload:
+                self.assertTrue(loadout.set_dark_reader_theme(profile, True))
+
+        self.assertEqual([(r[0], r[1]) for r in requests], [
+            ("page", "ServiceWorker.enable"),
+            ("page", "ServiceWorker.startWorker"),
+            ("worker", "Runtime.evaluate"),
+            ("browser", "Target.closeTarget"),
+        ])
+        self.assertFalse(any(method == "Target.createTarget" for _, method, _, _ in requests))
+        self.assertIn("const wanted = true", requests[2][2]["expression"])
+        self.assertEqual(events, ["capture", "change"])
+        reload.assert_called_once_with("9222", True, positions, include_web=True)
+
+    def test_set_theme_ignores_stale_offline_profile(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            self.assertFalse(loadout.set_dark_reader_theme(profile, True))
+
+    def test_chrome_theme_updates_each_profile(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td)
+            first = cache / "chrome-browser_0"
+            second = cache / "chrome-browser_1"
+            first.mkdir()
+            second.mkdir()
+            with patch.object(loadout, "CACHE_DIR", cache), \
+                 patch.object(loadout, "set_dark_reader_theme") as set_theme:
+                self.assertEqual(loadout.chrome_theme("light"), 0)
+                self.assertEqual((cache / "chrome-theme").read_text(), "light\n")
+        self.assertEqual(set_theme.call_count, 2)
+        set_theme.assert_any_call(first, False)
+        set_theme.assert_any_call(second, False)
 
 
 if __name__ == "__main__":

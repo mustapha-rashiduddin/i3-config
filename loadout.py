@@ -37,6 +37,7 @@ Run directly as:
 
     python3 loadout.py lock ./loadout
     python3 loadout.py unload
+    python3 loadout.py chrome-theme dark
 
 If this file is exposed on PATH as `lock`/`unload`, it also understands those
 invocation names, so the intended shell UX is simply `load <dir>`.
@@ -61,6 +62,7 @@ from __future__ import annotations
 import argparse
 import base64
 import errno
+import fcntl
 import json
 import os
 import re
@@ -86,6 +88,8 @@ RENAME_PIPE = Path.home() / ".config/i3/.rename_pipe"
 OVERLAY = Path.home() / ".config/i3/window_names.json"
 BROWSER_BIN = "google-chrome-stable"
 SCROLL_TIMEOUT = 10.0
+DARK_READER_ID = "eimadpbcbfnmbkopoojfekhnkhdbieeh"
+DARK_READER_TIMEOUT = 12.0
 
 
 class LoadoutError(RuntimeError):
@@ -481,12 +485,12 @@ def wait_new(before: set[int], *, pid: int | None = None, title: str | None = No
     raise LoadoutError("timed out waiting for application window")
 
 
-def wait_new_chrome(before: set[int], timeout: float = 25.0) -> Window:
+def wait_new_chrome(before: set[int], expected_class: str,
+                    timeout: float = 25.0) -> Window:
     """Wait for the Google Chrome window this launch created.
 
-    Chrome maps the app window a beat after the process exits, so watch the
-    tree for any node whose WM_CLASS is Google-chrome. Allowed longer than
-    wait_new: a brand-new profile pays for first-run setup.
+    Each launch gets a unique WM_CLASS. Requiring Chrome's app-window role as
+    well keeps a first-install extension help window from being claimed.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -495,7 +499,9 @@ def wait_new_chrome(before: set[int], timeout: float = 25.0) -> Window:
                 continue
             if node["id"] in before:
                 continue
-            if window_class(node).lower() == "google-chrome":
+            props = node.get("window_properties") or {}
+            if (window_class(node) == expected_class
+                    and props.get("window_role") == "pop-up"):
                 return window_from(node, workspace)
         time.sleep(0.1)
     raise LoadoutError("timed out waiting for a browser window")
@@ -600,6 +606,525 @@ def ws_read_message(sock: socket.socket, buf: bytes) -> tuple[str, bytes]:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         if first & 0x0F == 1 and first & 0x80:
             return payload.decode(errors="replace"), buf
+
+
+def cdp_request(sock: socket.socket, buf: bytes, request_id: int, method: str,
+                params: dict[str, Any] | None = None, *,
+                timeout: float = 3.0) -> tuple[dict[str, Any], bytes]:
+    """Send one CDP command and wait through unrelated events for its reply."""
+    request: dict[str, Any] = {"id": request_id, "method": method, "params": params or {}}
+    ws_send(sock, json.dumps(request))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sock.settimeout(max(0.1, deadline - time.monotonic()))
+        message, buf = ws_read_message(sock, buf)
+        try:
+            reply = json.loads(message)
+        except json.JSONDecodeError:
+            continue
+        if reply.get("id") != request_id:
+            continue
+        error = reply.get("error")
+        if isinstance(error, dict):
+            raise LoadoutError(f"Chrome DevTools: {error.get('message', 'command failed')}")
+        result = reply.get("result")
+        return (result if isinstance(result, dict) else {}), buf
+    raise LoadoutError(f"Chrome DevTools timed out running {method}")
+
+
+def file_page_scroll_positions(port: str, *, include_web: bool = False
+                               ) -> dict[str, tuple[float, float]]:
+    """Capture page scroll before Dark Reader changes the document layout."""
+    try:
+        targets = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json", timeout=1.5).read())
+    except Exception as exc:
+        raise LoadoutError("could not enumerate Chrome pages for Dark Reader") from exc
+    positions: dict[str, tuple[float, float]] = {}
+    for target in targets:
+        target_id = target.get("id")
+        url = target.get("url", "")
+        allowed = url.startswith("file:") or (
+            include_web and url.startswith(("http://", "https://")))
+        if (target.get("type") != "page" or not allowed
+                or not isinstance(target_id, str) or not target.get("webSocketDebuggerUrl")):
+            continue
+        sock: socket.socket | None = None
+        try:
+            sock, buf = ws_connect(target["webSocketDebuggerUrl"])
+            result, _ = cdp_request(
+                sock,
+                buf,
+                1,
+                "Runtime.evaluate",
+                {
+                    "expression": "({x: window.scrollX, y: window.scrollY})",
+                    "returnByValue": True,
+                },
+            )
+            value = result.get("result", {}).get("value")
+            if not isinstance(value, dict):
+                raise LoadoutError("Chrome DevTools returned no scroll position")
+            scroll_x = value.get("x")
+            scroll_y = value.get("y")
+            if not isinstance(scroll_x, (int, float)) or not isinstance(scroll_y, (int, float)):
+                raise LoadoutError("Chrome DevTools returned an invalid scroll position")
+            positions[target_id] = (scroll_x, scroll_y)
+        except (OSError, ConnectionError, ValueError) as exc:
+            raise LoadoutError(
+                f"could not capture scroll position for {target.get('url') or 'local page'}"
+            ) from exc
+        finally:
+            if sock is not None:
+                sock.close()
+    return positions
+
+
+def reload_file_pages(port: str, enabled: bool | None = None,
+                      positions: dict[str, tuple[float, float]] | None = None, *,
+                      include_web: bool = False) -> None:
+    """Reload app pages, preserve scroll, and verify local-file Dark Reader state."""
+    try:
+        targets = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json", timeout=1.5).read())
+    except Exception as exc:
+        raise LoadoutError("could not enumerate Chrome pages for Dark Reader") from exc
+    failures: list[str] = []
+    for target in targets:
+        url = target.get("url", "")
+        is_file = url.startswith("file:")
+        allowed = is_file or (include_web and url.startswith(("http://", "https://")))
+        if (target.get("type") != "page" or not allowed
+                or not target.get("webSocketDebuggerUrl")):
+            continue
+        sock: socket.socket | None = None
+        request_id = 0
+        try:
+            sock, buf = ws_connect(target["webSocketDebuggerUrl"])
+            position = (positions or {}).get(target.get("id"))
+            if position is None:
+                request_id += 1
+                before, buf = cdp_request(
+                    sock, buf, request_id, "Runtime.evaluate",
+                    {
+                        "expression": "({x: window.scrollX, y: window.scrollY})",
+                        "returnByValue": True,
+                    })
+                value = before.get("result", {}).get("value")
+                if not isinstance(value, dict):
+                    value = {}
+                scroll_x = value.get("x", 0)
+                scroll_y = value.get("y", 0)
+            else:
+                scroll_x, scroll_y = position
+            if not isinstance(scroll_x, (int, float)):
+                scroll_x = 0
+            if not isinstance(scroll_y, (int, float)):
+                scroll_y = 0
+            request_id += 1
+            frame_tree, buf = cdp_request(
+                sock,
+                buf,
+                request_id,
+                "Page.getFrameTree",
+            )
+            old_loader = frame_tree.get("frameTree", {}).get("frame", {}).get("loaderId")
+            if not isinstance(old_loader, str) or not old_loader:
+                raise LoadoutError("Chrome DevTools returned no document loader")
+            request_id += 1
+            _, buf = cdp_request(sock, buf, request_id, "Page.reload")
+            deadline = time.monotonic() + DARK_READER_TIMEOUT
+            while time.monotonic() < deadline:
+                request_id += 1
+                try:
+                    frame_tree, buf = cdp_request(
+                        sock, buf, request_id, "Page.getFrameTree")
+                    loader = frame_tree.get("frameTree", {}).get("frame", {}).get("loaderId")
+                    if not loader or loader == old_loader:
+                        time.sleep(0.1)
+                        continue
+                    request_id += 1
+                    state, buf = cdp_request(
+                        sock,
+                        buf,
+                        request_id,
+                        "Runtime.evaluate",
+                        {
+                            "expression": (
+                                "({ready: document.readyState === 'complete', "
+                                "active: document.documentElement.hasAttribute('data-darkreader-mode') || "
+                                "document.querySelector('style.darkreader, link.darkreader') !== null})"
+                            ),
+                            "returnByValue": True,
+                        },
+                    )
+                except LoadoutError:
+                    time.sleep(0.1)
+                    continue
+                value = state.get("result", {}).get("value")
+                expected = enabled if is_file else None
+                if (isinstance(value, dict) and value.get("ready") is True
+                        and (expected is None or value.get("active") is expected)):
+                    request_id += 1
+                    _, buf = cdp_request(
+                        sock,
+                        buf,
+                        request_id,
+                        "Runtime.evaluate",
+                        {"expression": f"window.scrollTo({scroll_x:g}, {scroll_y:g})"},
+                    )
+                    break
+                time.sleep(0.1)
+            else:
+                failures.append(target.get("url") or "local page")
+        except (LoadoutError, OSError, ConnectionError, ValueError):
+            failures.append(target.get("url") or "local page")
+        finally:
+            if sock is not None:
+                sock.close()
+    if failures:
+        pages = ", ".join(failures)
+        if enabled is None:
+            raise LoadoutError(f"Dark Reader did not finish reloading {pages}")
+        mode = "dark" if enabled else "light"
+        raise LoadoutError(f"Dark Reader did not make {pages} {mode}")
+
+
+def ensure_dark_reader_file_access(profile: Path, *, wait: bool = False,
+                                   intended_url: str | None = None) -> bool:
+    """Enable Dark Reader on file URLs through Chrome's extension settings API."""
+    deadline = time.monotonic() + DARK_READER_TIMEOUT
+    while True:
+        try:
+            lines = (profile / "DevToolsActivePort").read_text().splitlines()
+        except OSError:
+            lines = []
+        if len(lines) >= 2 and lines[0].isdigit() and lines[1].startswith("/"):
+            try:
+                browser_sock, browser_buf = ws_connect(
+                    f"ws://127.0.0.1:{lines[0]}{lines[1]}")
+                break
+            except (OSError, ConnectionError):
+                pass
+        if not wait or time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+    target_id: str | None = None
+    target_sock: socket.socket | None = None
+    browser_request_id = 0
+
+    def browser_command(method: str, params: dict[str, Any] | None = None,
+                        *, timeout: float = 3.0) -> dict[str, Any]:
+        nonlocal browser_buf, browser_request_id
+        browser_request_id += 1
+        result, browser_buf = cdp_request(
+            browser_sock, browser_buf, browser_request_id, method, params, timeout=timeout)
+        return result
+
+    try:
+        created = browser_command(
+            "Target.createTarget", {"url": "chrome://extensions/", "background": True})
+        target_id = created.get("targetId")
+        if not isinstance(target_id, str):
+            raise LoadoutError("Chrome DevTools did not create the extensions target")
+        target_url = f"ws://127.0.0.1:{lines[0]}/devtools/page/{target_id}"
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                target_sock, target_buf = ws_connect(target_url)
+                break
+            except (OSError, ConnectionError):
+                time.sleep(0.1)
+        else:
+            raise LoadoutError("Chrome DevTools could not attach to extension settings")
+
+        expression = f"""
+(async () => {{
+    const id = {json.dumps(DARK_READER_ID)};
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const getInfo = () => new Promise((resolve, reject) => {{
+        chrome.developerPrivate.getExtensionInfo(id, (info) => {{
+            const error = chrome.runtime.lastError;
+            error || !info ? reject(new Error(error?.message || "Dark Reader is not installed"))
+                           : resolve(info);
+        }});
+    }});
+    const update = () => new Promise((resolve, reject) => {{
+        chrome.developerPrivate.updateExtensionConfiguration(
+            {{extensionId: id, fileAccess: true}},
+            () => {{
+                const error = chrome.runtime.lastError;
+                error ? reject(new Error(error.message)) : resolve();
+            }}
+        );
+    }});
+    const enable = () => new Promise((resolve, reject) => {{
+        chrome.management.setEnabled(id, true, () => {{
+            const error = chrome.runtime.lastError;
+            error ? reject(new Error(error.message)) : resolve();
+        }});
+    }});
+
+    let before = null;
+    for (let i = 0; i < 80 && before === null; i++) {{
+        try {{ before = await getInfo(); }} catch (_) {{ await sleep(100); }}
+    }}
+    if (before === null) {{ throw new Error("Dark Reader was not installed by policy"); }}
+    let changed = before.state !== "ENABLED";
+    if (changed) {{
+        await enable();
+        before = await getInfo();
+    }}
+    if (before.fileAccess?.isActive !== true) {{
+        await update();
+        changed = true;
+    }}
+    for (let i = 0; i < 80; i++) {{
+        const after = await getInfo();
+        if (after.state === "ENABLED" && after.fileAccess?.isEnabled === true &&
+                after.fileAccess?.isActive === true) {{
+            return {{changed}};
+        }}
+        await sleep(100);
+    }}
+    throw new Error("Chrome did not enable Dark Reader for file URLs");
+}})()
+""".strip()
+        evaluated, target_buf = cdp_request(
+            target_sock,
+            target_buf,
+            1,
+            "Runtime.evaluate",
+            {"expression": expression, "awaitPromise": True, "returnByValue": True},
+            timeout=DARK_READER_TIMEOUT,
+        )
+        if evaluated.get("exceptionDetails"):
+            details = evaluated["exceptionDetails"]
+            message = details.get("exception", {}).get("description") or details.get("text")
+            raise LoadoutError(f"Dark Reader setup: {message or 'file access failed'}")
+        value = evaluated.get("result", {}).get("value")
+        if not isinstance(value, dict):
+            raise LoadoutError("Dark Reader did not confirm file access")
+        changed = value.get("changed") is True
+        if wait and changed:
+            try:
+                targets = json.loads(urllib.request.urlopen(
+                    f"http://127.0.0.1:{lines[0]}/json", timeout=1.5).read())
+            except Exception:
+                targets = []
+            wanted = urllib.parse.urldefrag(intended_url or "")[0].rstrip("/")
+            for target in targets:
+                url = target.get("url", "")
+                help_target_id = target.get("id")
+                actual = urllib.parse.urldefrag(url)[0].rstrip("/")
+                if (target.get("type") != "page"
+                        or not url.startswith("https://darkreader.org/help/")
+                        or not isinstance(help_target_id, str)
+                        or (wanted and (actual == wanted or actual.startswith(wanted + "/")))):
+                    continue
+                try:
+                    browser_command("Target.closeTarget", {"targetId": help_target_id})
+                except LoadoutError:
+                    pass
+    except (OSError, ConnectionError, ValueError) as exc:
+        raise LoadoutError(f"Dark Reader setup failed for {profile.name}: {exc}") from exc
+    finally:
+        if target_id is not None:
+            try:
+                browser_command("Target.closeTarget", {"targetId": target_id})
+            except (LoadoutError, OSError, ConnectionError):
+                pass
+        if target_sock is not None:
+            target_sock.close()
+        browser_sock.close()
+
+    if changed:
+        reload_file_pages(lines[0])
+    return True
+
+
+def dark_reader_expression(enabled: bool) -> str:
+    """Persist Dark Reader settings from its existing service worker."""
+    wanted = json.dumps(enabled)
+    return f"""
+(async () => {{
+    const wanted = {wanted};
+    const local = await chrome.storage.local.get(["syncSettings", "automation", "theme"]);
+    const area = local.syncSettings === false ? chrome.storage.local : chrome.storage.sync;
+    const before = await area.get(["automation", "theme"]);
+    const automation = {{...(before.automation || {{}}), enabled: false}};
+    const theme = {{...(before.theme || {{}}), mode: 1, engine: "dynamicTheme"}};
+    await area.set({{enabled: wanted, automation, theme}});
+    const stored = await area.get(["enabled", "automation", "theme"]);
+    if (stored.enabled === wanted && stored.automation?.enabled === false &&
+            stored.theme?.mode === 1 && stored.theme?.engine === "dynamicTheme") {{
+        return {{
+            enabled: stored.enabled,
+            automationEnabled: stored.automation.enabled,
+            mode: stored.theme.mode,
+            engine: stored.theme.engine,
+        }};
+    }}
+    throw new Error("Dark Reader state did not persist");
+}})()
+""".strip()
+
+
+def set_dark_reader_theme(profile: Path, enabled: bool) -> bool:
+    """Set Dark Reader in one live loadout Chrome profile; false means offline."""
+    try:
+        lines = (profile / "DevToolsActivePort").read_text().splitlines()
+    except OSError:
+        return False
+    if len(lines) < 2 or not lines[0].isdigit() or not lines[1].startswith("/"):
+        return False
+    try:
+        browser_probe, _ = ws_connect(f"ws://127.0.0.1:{lines[0]}{lines[1]}")
+    except (OSError, ConnectionError):
+        return False
+    browser_probe.close()
+    try:
+        targets = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{lines[0]}/json", timeout=1.5).read())
+    except Exception:
+        return False
+    pages = [
+        target for target in targets
+        if (target.get("type") == "page"
+            and target.get("url", "").startswith(("file:", "http://", "https://"))
+            and target.get("webSocketDebuggerUrl"))
+    ]
+    if not pages:
+        return False
+    positions = file_page_scroll_positions(lines[0], include_web=True)
+    try:
+        page_sock, page_buf = ws_connect(pages[0]["webSocketDebuggerUrl"])
+        try:
+            _, page_buf = cdp_request(page_sock, page_buf, 1, "ServiceWorker.enable")
+            _, page_buf = cdp_request(
+                page_sock,
+                page_buf,
+                2,
+                "ServiceWorker.startWorker",
+                {"scopeURL": f"chrome-extension://{DARK_READER_ID}/"},
+            )
+        finally:
+            page_sock.close()
+
+        deadline = time.monotonic() + 3.0
+        worker = None
+        while time.monotonic() < deadline:
+            try:
+                targets = json.loads(urllib.request.urlopen(
+                    f"http://127.0.0.1:{lines[0]}/json", timeout=1.5).read())
+                worker = next((target for target in targets
+                               if target.get("type") == "service_worker"
+                               and target.get("url", "").startswith(
+                                   f"chrome-extension://{DARK_READER_ID}/")
+                               and target.get("webSocketDebuggerUrl")), None)
+                if worker is not None:
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.1)
+        if worker is None:
+            raise LoadoutError(f"Dark Reader worker is not running in {profile.name}")
+
+        worker_sock, worker_buf = ws_connect(worker["webSocketDebuggerUrl"])
+        try:
+            evaluated, worker_buf = cdp_request(
+                worker_sock,
+                worker_buf,
+                1,
+                "Runtime.evaluate",
+                {
+                    "expression": dark_reader_expression(enabled),
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                },
+                timeout=6.0,
+            )
+        finally:
+            worker_sock.close()
+        if evaluated.get("exceptionDetails"):
+            details = evaluated["exceptionDetails"]
+            message = details.get("exception", {}).get("description") or details.get("text")
+            raise LoadoutError(f"Dark Reader: {message or 'theme change failed'}")
+        value = evaluated.get("result", {}).get("value")
+        if (not isinstance(value, dict) or value.get("enabled") is not enabled
+                or value.get("mode") != 1 or value.get("engine") != "dynamicTheme"):
+            raise LoadoutError("Dark Reader did not persist the requested theme")
+
+        browser_sock, browser_buf = ws_connect(f"ws://127.0.0.1:{lines[0]}{lines[1]}")
+        try:
+            stopped, browser_buf = cdp_request(
+                browser_sock,
+                browser_buf,
+                1,
+                "Target.closeTarget",
+                {"targetId": worker["id"]},
+            )
+        finally:
+            browser_sock.close()
+        if stopped.get("success") is not True:
+            raise LoadoutError("Chrome did not restart Dark Reader")
+    except (OSError, ConnectionError, ValueError) as exc:
+        raise LoadoutError(f"Dark Reader control failed for {profile.name}: {exc}") from exc
+
+    reload_file_pages(
+        lines[0], enabled, positions, include_web=True)
+    return True
+
+
+def chrome_theme(theme: str) -> int:
+    """Set Dark Reader in every currently running isolated loadout profile."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with (CACHE_DIR / "chrome-theme.lock").open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        state = CACHE_DIR / "chrome-theme"
+        temporary = CACHE_DIR / "chrome-theme.tmp"
+        temporary.write_text(theme + "\n")
+        os.replace(temporary, state)
+
+        enabled = theme == "dark"
+        failures: list[str] = []
+        for profile in sorted(CACHE_DIR.glob("chrome-browser_*")):
+            if not profile.is_dir():
+                continue
+            try:
+                set_dark_reader_theme(profile, enabled)
+            except LoadoutError as exc:
+                failures.append(str(exc))
+        if failures:
+            raise LoadoutError("; ".join(failures))
+    return 0
+
+
+def desired_chrome_theme() -> str:
+    """Return the last browser theme, falling back to the current terminal theme."""
+    sources = (
+        CACHE_DIR / "chrome-theme",
+        Path.home() / ".config/config-manager/current-st-theme",
+    )
+    for source in sources:
+        try:
+            theme = source.read_text().strip()
+        except OSError:
+            continue
+        if theme in {"light", "dark"}:
+            return theme
+    return "dark"
+
+
+def apply_current_chrome_theme(profile: Path) -> None:
+    """Apply the persisted mode to a browser that just joined the live profiles."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with (CACHE_DIR / "chrome-theme.lock").open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        theme = desired_chrome_theme()
+        if not set_dark_reader_theme(profile, theme == "dark"):
+            raise LoadoutError(f"could not apply Dark Reader theme to {profile.name}")
 
 
 def chrome_scroll(target_ws: str, expression: str) -> dict[str, Any] | None:
@@ -869,16 +1394,19 @@ class Controller:
             win = wait_new(before, pid=proc.pid, title=title)
         elif entry.kind == "browser":
             profile = CACHE_DIR / ("chrome-" + entry.ident.replace(":", "_"))
+            app_class = "loadout-" + entry.ident.replace(":", "-")
             command = [
                 BROWSER_BIN,
                 f"--user-data-dir={profile}",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--remote-debugging-port=0",
+                "--allow-file-access-from-files",
+                f"--class={app_class}",
                 "--app=" + entry.url,
             ]
             try:
-                subprocess.Popen(
+                proc = subprocess.Popen(
                     command,
                     cwd=entry.cwd,
                     stdin=subprocess.DEVNULL,
@@ -888,7 +1416,15 @@ class Controller:
                 )
             except FileNotFoundError as exc:
                 raise LoadoutError(f"browser command not found: {command[0]}") from exc
-            win = wait_new_chrome(before)
+            try:
+                win = wait_new_chrome(before, app_class)
+                if not ensure_dark_reader_file_access(
+                        profile, wait=True, intended_url=entry.url):
+                    raise LoadoutError("could not configure Dark Reader")
+                apply_current_chrome_theme(profile)
+            except LoadoutError:
+                stop_process(proc)
+                raise
             if entry.scroll is not None:
                 scroll_site(profile, entry)
         else:
@@ -1144,6 +1680,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_lock.add_argument("file")
     sub.add_parser("unload")
     sub.add_parser("status")
+    p_chrome_theme = sub.add_parser("chrome-theme")
+    p_chrome_theme.add_argument("theme", choices=("light", "dark"))
     p_heal = sub.add_parser("heal")
     p_occ = sub.add_parser("_occupied", help=argparse.SUPPRESS)
     p_occ.add_argument("file")
@@ -1175,6 +1713,8 @@ def main(argv: list[str] | None = None) -> int:
             return unload()
         if args.subcommand == "status":
             return status()
+        if args.subcommand == "chrome-theme":
+            return chrome_theme(args.theme)
         if args.subcommand == "heal":
             return heal()
         if args.subcommand == "_occupied":

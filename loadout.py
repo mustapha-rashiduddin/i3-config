@@ -1650,8 +1650,9 @@ class Controller:
         i3(f"[con_id={win.con_id}] mark --add {quote(WINDOW_MARK_PREFIX + entry.ident)}")
         if win.workspace != entry.slot:
             i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
-        # Only st terminals get renamed; emacs is always just Emacs.
-        if entry.kind == "terminal":
+        # Terminals and loadout browser windows carry their loadout name;
+        # emacs is always just Emacs.
+        if entry.kind in ("terminal", "browser"):
             rename_window(win, entry.name)
 
     def claim(self, entry: Entry, con_id: int) -> None:
@@ -1664,7 +1665,7 @@ class Controller:
         i3(f"[con_id={win.con_id}] mark --add {quote(WINDOW_MARK_PREFIX + entry.ident)}")
         if win.workspace != entry.slot:
             i3(f"[con_id={win.con_id}] move container to workspace {quote(entry.slot)}")
-        if entry.kind == "terminal":
+        if entry.kind in ("terminal", "browser"):
             rename_window(win, entry.name)
         elif entry.kind == "emacs" and not self.emacs_driven:
             run(["emacsclient", "--eval", emacs_plant(entry.cwd)])

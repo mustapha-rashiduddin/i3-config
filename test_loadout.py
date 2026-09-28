@@ -887,7 +887,7 @@ class BrowserLaunchTests(unittest.TestCase):
              patch.object(loadout, "apply_current_chrome_theme") as apply_theme, \
              patch.object(loadout, "wait_new_chrome", side_effect=wait_for_browser) as wait, \
              patch.object(loadout, "scroll_site") as scroll, \
-             patch.object(loadout, "rename_window"):
+             patch.object(loadout, "rename_window") as rename:
             loadout.Controller(spec).launch(entry)
         argv = spawned["argv"]
         self.assertEqual(argv[0], loadout.BROWSER_BIN)
@@ -903,6 +903,8 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertEqual(events, ["wait", "ensure"])
         apply_theme.assert_called_once_with(loadout.CACHE_DIR / "chrome-browser_0")
         scroll.assert_called_once()
+        rename.assert_called_once_with(
+            loadout.Window(1, 100, 123, "t", "m", ()), "mozilla")
 
     def test_launch_without_scroll_skips_scrolling(self):
         entry = loadout.Entry("browser:0", "browser", "m", "mozilla", Path("/tmp"),

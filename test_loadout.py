@@ -1480,5 +1480,167 @@ name = "doc"
         run.assert_not_called()
 
 
+class RestorePositionTests(unittest.TestCase):
+    def _loadout(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "loadout").write_text('''[[browser]]
+url = "https://example.org/target"
+name = "doc"
+scroll = "40%"
+''')
+        win = loadout.Window(1, 100, None, "doc", "j",
+                             (f"loadout:{root}", "loadout-win:browser:0"))
+        spec = loadout.load_spec(root / "loadout")
+        return win, spec, root
+
+    def _tree_with(self, win):
+        return {"type": "root", "nodes": [
+            {"type": "workspace", "name": win.workspace, "nodes": [
+                {"id": win.con_id, "window": win.xid, "focused": True,
+                 "marks": win.marks},
+            ]},
+        ]}
+
+    def _devtools(self, td, target_url, states):
+        profile = Path(td)
+        (profile / "DevToolsActivePort").write_text("9222\n")
+        response = types.SimpleNamespace(read=lambda: json.dumps([
+            {"type": "page", "url": target_url,
+             "webSocketDebuggerUrl": "ws://target"}]).encode())
+
+        class FakeSocket:
+            def close(self):
+                pass
+
+        fake_socket = FakeSocket()
+        queue = list(states)
+
+        def request(sock, buf, request_id, method, params=None, **kwargs):
+            if method == "Page.navigate":
+                return {"frameId": "f"}, b""
+            expr = (params or {}).get("expression", "")
+            if "location.href" in expr:
+                state = queue.pop(0)
+                return {"result": {"value": state}}, b""
+            return {"result": {"value": json.dumps(
+                {"top": 400, "want": 400, "max": 1000})}}, b""
+
+        return profile, response, fake_socket, request
+
+    def test_restore_position_focused_browser(self):
+        win, spec, root = self._loadout()
+        with patch.object(loadout, "get_tree", return_value=self._tree_with(win)), \
+             patch.object(loadout, "active_spec", return_value=spec), \
+             patch.object(loadout, "position_browser",
+                          return_value="https://example.org/target, scroll 40%") as pos:
+            code = loadout.restore_position()
+        self.assertEqual(code, 0)
+        pos.assert_called_once_with(
+            loadout.CACHE_DIR / "chrome-browser_0", spec.entries[0])
+
+    def test_restore_position_noop_when_already_there(self):
+        win, spec, root = self._loadout()
+        with patch.object(loadout, "get_tree", return_value=self._tree_with(win)), \
+             patch.object(loadout, "active_spec", return_value=spec), \
+             patch.object(loadout, "position_browser", return_value="") as pos:
+            code = loadout.restore_position()
+        self.assertEqual(code, 0)
+        pos.assert_called_once()
+
+    def test_restore_position_rejects_non_browser_window(self):
+        win, spec, root = self._loadout()
+        term = loadout.Window(1, 100, None, "sql", "k",
+                              (f"loadout:{root}", "loadout-win:terminal:0"))
+        with patch.object(loadout, "get_tree", return_value=self._tree_with(term)), \
+             patch.object(loadout, "active_spec", return_value=spec), \
+             patch.object(loadout, "position_browser") as pos:
+            code = loadout.restore_position()
+        self.assertEqual(code, 1)
+        pos.assert_not_called()
+
+    def test_restore_position_no_engaged_loadout(self):
+        win, spec, root = self._loadout()
+        with patch.object(loadout, "get_tree", return_value=self._tree_with(win)), \
+             patch.object(loadout, "active_spec", return_value=None), \
+             patch.object(loadout, "position_browser") as pos:
+            code = loadout.restore_position()
+        self.assertEqual(code, 1)
+        pos.assert_not_called()
+
+    def test_position_browser_navigates_then_scrolls(self):
+        entry = loadout.Entry("browser:0", "browser", "j", "doc", Path("/tmp"),
+                              url="https://example.org/target", scroll="40%")
+        with tempfile.TemporaryDirectory() as td:
+            profile, response, fake_socket, request = self._devtools(
+                td, "https://example.org/old", [
+                    {"url": "https://example.org/old", "y": 100, "max": 1000,
+                     "ready": "complete"},
+                    {"url": "https://example.org/target", "y": 0, "max": 1000,
+                     "ready": "complete"},
+                ])
+            calls = []
+
+            def wrapped(sock, buf, request_id, method, params=None, **kwargs):
+                calls.append((method, (params or {}).get("url", ""),
+                              (params or {}).get("expression", "")))
+                return request(sock, buf, request_id, method, params, **kwargs)
+
+            with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+                 patch.object(loadout, "ws_connect", return_value=(fake_socket, b"")), \
+                 patch.object(loadout, "cdp_request", side_effect=wrapped):
+                summary = loadout.position_browser(profile, entry)
+        self.assertEqual(summary, "https://example.org/target, scroll 40%")
+        self.assertIn(("Page.navigate", "https://example.org/target", ""), calls)
+        self.assertTrue(any("scrollTop" in expr for _, _, expr in calls))
+
+    def test_position_browser_scrolls_without_navigating(self):
+        entry = loadout.Entry("browser:0", "browser", "j", "doc", Path("/tmp"),
+                              url="https://example.org/target", scroll="40%")
+        with tempfile.TemporaryDirectory() as td:
+            profile, response, fake_socket, request = self._devtools(
+                td, "https://example.org/target", [
+                    {"url": "https://example.org/target", "y": 100, "max": 1000,
+                     "ready": "complete"},
+                ])
+            calls = []
+
+            def wrapped(sock, buf, request_id, method, params=None, **kwargs):
+                calls.append((method, (params or {}).get("url", ""),
+                              (params or {}).get("expression", "")))
+                return request(sock, buf, request_id, method, params, **kwargs)
+
+            with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+                 patch.object(loadout, "ws_connect", return_value=(fake_socket, b"")), \
+                 patch.object(loadout, "cdp_request", side_effect=wrapped):
+                summary = loadout.position_browser(profile, entry)
+        self.assertEqual(summary, "scroll 40%")
+        self.assertNotIn(("Page.navigate", "https://example.org/target", ""), calls)
+        self.assertTrue(any("scrollTop" in expr for _, _, expr in calls))
+
+    def test_position_browser_noop_when_already_in_place(self):
+        entry = loadout.Entry("browser:0", "browser", "j", "doc", Path("/tmp"),
+                              url="https://example.org/target", scroll="40%")
+        with tempfile.TemporaryDirectory() as td:
+            profile, response, fake_socket, request = self._devtools(
+                td, "https://example.org/target", [
+                    {"url": "https://example.org/target", "y": 400, "max": 1000,
+                     "ready": "complete"},
+                ])
+            calls = []
+
+            def wrapped(sock, buf, request_id, method, params=None, **kwargs):
+                calls.append((method, (params or {}).get("url", ""),
+                              (params or {}).get("expression", "")))
+                return request(sock, buf, request_id, method, params, **kwargs)
+
+            with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+                 patch.object(loadout, "ws_connect", return_value=(fake_socket, b"")), \
+                 patch.object(loadout, "cdp_request", side_effect=wrapped):
+                summary = loadout.position_browser(profile, entry)
+        self.assertEqual(summary, "")
+        self.assertNotIn(("Page.navigate", "https://example.org/target", ""), calls)
+        self.assertFalse(any("scrollTop" in expr for _, _, expr in calls))
+
+
 if __name__ == "__main__":
     unittest.main()

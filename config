@@ -107,6 +107,9 @@ bindsym $mod+n exec --no-startup-id ~/.config/i3/rename-window.sh
 # Save focused loadout browser's URL and scroll position into its loadout file
 bindsym $mod+p exec --no-startup-id ~/.config/i3/loadout.py save-scroll
 
+# Restore focused loadout browser to the loadout's saved URL and scroll position
+bindsym $mod+s exec --no-startup-id ~/.config/i3/loadout.py restore-position
+
 # Cycle through windows forward
 bindsym $mod+Tab focus right
 

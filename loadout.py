@@ -38,6 +38,8 @@ Run directly as:
     python3 loadout.py lock ./loadout
     python3 loadout.py unload
     python3 loadout.py chrome-theme dark
+    python3 loadout.py save-scroll     # mod+p: write current url+scroll to the loadout
+    python3 loadout.py restore-position  # mod+s: go back to the loadout's url+scroll
 
 If this file is exposed on PATH as `lock`/`unload`, it also understands those
 invocation names, so the intended shell UX is simply `load <dir>`.
@@ -1253,6 +1255,38 @@ def save_scroll() -> int:
     return 0
 
 
+def restore_position() -> int:
+    """Send the focused loadout browser back to the loadout's url and scroll.
+
+    The mirror of save-scroll: mod+p writes where you are into the loadout,
+    this reads it back. Both navigation and scrolling are skipped when the
+    browser is already exactly where the loadout specifies.
+    """
+    tree = get_tree()
+    win = focused_window(tree)
+    if win is None:
+        print("loadout: no focused window", file=sys.stderr)
+        return 1
+    ident = next((mark[len(WINDOW_MARK_PREFIX):] for mark in win.marks
+                  if mark.startswith(WINDOW_MARK_PREFIX)), None)
+    if not ident or not ident.startswith("browser:"):
+        print("loadout: focused window is not a loadout browser", file=sys.stderr)
+        return 1
+    spec = active_spec()
+    if spec is None:
+        print("loadout: no engaged loadout", file=sys.stderr)
+        return 1
+    entry = next((e for e in spec.entries if e.ident == ident), None)
+    if entry is None or entry.kind != "browser":
+        print(f"loadout: no loadout browser entry {ident!r}", file=sys.stderr)
+        return 1
+    changed = position_browser(
+        CACHE_DIR / ("chrome-" + ident.replace(":", "_")), entry)
+    if changed:
+        print(f"loadout: restored {ident}: {changed}")
+    return 0
+
+
 def browser_page_state(profile: Path, entry: Entry) -> tuple[int, str]:
     """Return the focused browser page's (scroll percent, current url).
 
@@ -1323,6 +1357,114 @@ def browser_page_state(profile: Path, entry: Entry) -> tuple[int, str]:
 def page_scroll_percent(profile: Path, entry: Entry) -> int:
     """Scroll percentage of the focused loadout browser page."""
     return browser_page_state(profile, entry)[0]
+
+
+def page_state_expr() -> str:
+    """JS for CDP Runtime.evaluate: current url, scroll depth, and readiness."""
+    return (
+        "(() => {"
+        "  const r = document.scrollingElement || document.documentElement;"
+        "  return {url: location.href, y: window.scrollY,"
+        "          max: r.scrollHeight - r.clientHeight,"
+        "          ready: document.readyState};"
+        "})()"
+    )
+
+
+def scroll_target(scroll: int | str, max_height: float) -> int:
+    """Pixel target for an int offset or a "N%" depth, clamped to the page."""
+    if isinstance(scroll, int):
+        return max(0, min(scroll, int(max_height)))
+    fraction = float(scroll.strip().rstrip("%")) / 100.0
+    return int(round(max_height * fraction))
+
+
+def _page_state(sock: socket.socket, buf: bytes) -> dict[str, Any] | None:
+    """Live {url, y, max, ready} for the connected page, or None mid-transition."""
+    try:
+        result, _ = cdp_request(
+            sock,
+            buf,
+            1,
+            "Runtime.evaluate",
+            {"expression": page_state_expr(), "returnByValue": True},
+        )
+    except LoadoutError:
+        return None
+    value = result.get("result", {}).get("value")
+    if not isinstance(value, dict):
+        return None
+    url = value.get("url")
+    y = value.get("y")
+    max_height = value.get("max")
+    ready = value.get("ready")
+    if (not isinstance(url, str) or not isinstance(y, (int, float))
+            or not isinstance(max_height, (int, float)) or not isinstance(ready, str)):
+        return None
+    return {"url": url, "y": float(y), "max": float(max_height), "ready": ready}
+
+
+def position_browser(profile: Path, entry: Entry) -> str:
+    """Drive the loadout browser back to entry.url / entry.scroll.
+
+    Returns a human summary of what was restored ("" when the page is already
+    exactly where the loadout says). Navigation is skipped when the live URL
+    already equals entry.url, so an identical page is never disturbed; scrolling
+    is skipped when the page is already within 2px of the target depth.
+    """
+    try:
+        lines = (profile / "DevToolsActivePort").read_text().splitlines()
+    except OSError as exc:
+        raise LoadoutError("browser DevTools port unavailable") from exc
+    if not lines or not lines[0].isdigit():
+        raise LoadoutError("browser DevTools port unavailable")
+    port = lines[0]
+    try:
+        targets = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json", timeout=1.5).read())
+    except (OSError, ConnectionError, ValueError) as exc:
+        raise LoadoutError("could not enumerate browser pages") from exc
+    page = next((t for t in targets
+                 if t.get("type") == "page" and t.get("url") == entry.url
+                 and t.get("webSocketDebuggerUrl")), None)
+    if page is None:
+        page = next((t for t in targets
+                     if t.get("type") == "page" and t.get("webSocketDebuggerUrl")), None)
+    if page is None:
+        raise LoadoutError("no browser page found")
+    sock: socket.socket | None = None
+    try:
+        sock, buf = ws_connect(page["webSocketDebuggerUrl"])
+        state = _page_state(sock, buf)
+        if state is None:
+            raise LoadoutError("browser page unresponsive")
+        done: list[str] = []
+        if entry.url is not None and state["url"] != entry.url:
+            try:
+                cdp_request(sock, buf, 1, "Page.navigate", {"url": entry.url})
+            except LoadoutError as exc:
+                raise LoadoutError(f"could not navigate browser to {entry.url}") from exc
+            deadline = time.monotonic() + SCROLL_TIMEOUT
+            while time.monotonic() < deadline:
+                time.sleep(0.2)
+                state = _page_state(sock, buf)
+                if state is not None and state["url"] == entry.url and state["ready"] == "complete":
+                    break
+            else:
+                raise LoadoutError(f"browser did not finish loading {entry.url}")
+            done.append(entry.url)
+        if entry.scroll is not None and state is not None and state["max"] > 0:
+            want = scroll_target(entry.scroll, state["max"])
+            if abs(state["y"] - want) > 2:
+                cdp_request(sock, buf, 2, "Runtime.evaluate", {
+                    "expression": browser_scroll_expr(entry.scroll),
+                    "returnByValue": True,
+                })
+                done.append(f"scroll {entry.scroll}")
+        return ", ".join(done)
+    finally:
+        if sock is not None:
+            sock.close()
 
 
 def toml_quote(value: str) -> str:
@@ -1875,6 +2017,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_chrome_theme.add_argument("theme", choices=("light", "dark"))
     p_heal = sub.add_parser("heal")
     sub.add_parser("save-scroll")
+    sub.add_parser("restore-position")
     p_occ = sub.add_parser("_occupied", help=argparse.SUPPRESS)
     p_occ.add_argument("file")
     p_emacs = sub.add_parser("_emacs_path", help=argparse.SUPPRESS)
@@ -1911,6 +2054,8 @@ def main(argv: list[str] | None = None) -> int:
             return heal()
         if args.subcommand == "save-scroll":
             return save_scroll()
+        if args.subcommand == "restore-position":
+            return restore_position()
         if args.subcommand == "_occupied":
             spec = load_spec(args.file)
             _, leftover = plan(spec, get_tree())

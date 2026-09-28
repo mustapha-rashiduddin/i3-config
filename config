@@ -104,7 +104,7 @@ bindsym $mod+Mod1+slash move container to workspace $ws8
 # Rename window
 bindsym $mod+n exec --no-startup-id ~/.config/i3/rename-window.sh
 
-# Save focused loadout browser's scroll position into its loadout file
+# Save focused loadout browser's URL and scroll position into its loadout file
 bindsym $mod+p exec --no-startup-id ~/.config/i3/loadout.py save-scroll
 
 # Cycle through windows forward

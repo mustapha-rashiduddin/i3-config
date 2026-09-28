@@ -1237,9 +1237,9 @@ def save_scroll() -> int:
         print(f"loadout: no loadout browser entry {ident!r}", file=sys.stderr)
         return 1
     browser_number = int(ident.split(":", 1)[1])
-    percent = page_scroll_percent(
+    percent, url = browser_page_state(
         CACHE_DIR / ("chrome-" + ident.replace(":", "_")), entry)
-    prompt = f"Save scroll = {percent}% in {spec.source.name}?"
+    prompt = f"Save scroll = {percent}% at {url} in {spec.source.name}?"
     try:
         choice = subprocess.run(
             ["dmenu", "-p", prompt], input="No\nYes", text=True,
@@ -1248,17 +1248,17 @@ def save_scroll() -> int:
         return 1
     if choice.stdout.strip().lower() not in {"y", "yes"}:
         return 0
-    rewrite_scroll(spec.source, browser_number, percent)
-    print(f"loadout: saved scroll = {percent}% in {spec.source}")
+    rewrite_browser_state(spec.source, browser_number, percent, url)
+    print(f"loadout: saved scroll = {percent}% at {url} in {spec.source}")
     return 0
 
 
-def page_scroll_percent(profile: Path, entry: Entry) -> int:
-    """Return the focused browser page's scroll as a rounded percentage.
+def browser_page_state(profile: Path, entry: Entry) -> tuple[int, str]:
+    """Return the focused browser page's (scroll percent, current url).
 
     Reads the profile's DevToolsActivePort for a live --remote-debugging-port=0
-    port, then asks the page for {y: scrollY, max: scrollable height}. A page
-    that cannot scroll reports 0%.
+    port, then asks the page for {y: scrollY, max: scrollable height, url:
+    location.href} in one round-trip. A page that cannot scroll reports 0%.
     """
     try:
         lines = (profile / "DevToolsActivePort").read_text().splitlines()
@@ -1292,7 +1292,8 @@ def page_scroll_percent(profile: Path, entry: Entry) -> int:
                 "expression": (
                     "(() => {"
                     "  const r = document.scrollingElement || document.documentElement;"
-                    "  return {y: window.scrollY, max: r.scrollHeight - r.clientHeight};"
+                    "  return {y: window.scrollY, max: r.scrollHeight - r.clientHeight,"
+                    "          url: location.href};"
                     "})()"
                 ),
                 "returnByValue": True,
@@ -1300,14 +1301,18 @@ def page_scroll_percent(profile: Path, entry: Entry) -> int:
         )
         value = result.get("result", {}).get("value")
         if not isinstance(value, dict):
-            raise LoadoutError("browser returned no scroll position")
+            raise LoadoutError("browser returned no page state")
         y = value.get("y")
         max_height = value.get("max")
+        url = value.get("url")
+        if not isinstance(url, str):
+            raise LoadoutError("browser returned an invalid url")
         if not isinstance(y, (int, float)) or not isinstance(max_height, (int, float)):
             raise LoadoutError("browser returned an invalid scroll position")
-        if max_height <= 0:
-            return 0
-        return max(0, min(100, int(round(100 * y / max_height))))
+        percent = 0
+        if max_height > 0:
+            percent = max(0, min(100, int(round(100 * y / max_height))))
+        return percent, url
     except (OSError, ConnectionError, ValueError) as exc:
         raise LoadoutError("could not read browser scroll position") from exc
     finally:
@@ -1315,14 +1320,24 @@ def page_scroll_percent(profile: Path, entry: Entry) -> int:
             sock.close()
 
 
-def rewrite_scroll(path: Path, browser_number: int, percent: int) -> None:
-    """Set `scroll = "N%"` on the browser_numberth [[browser]] block.
+def page_scroll_percent(profile: Path, entry: Entry) -> int:
+    """Scroll percentage of the focused loadout browser page."""
+    return browser_page_state(profile, entry)[0]
 
-    Edits only the one block's `scroll` line (or inserts one right after its
-    `url` line), preserving every other line, comment, and blank verbatim. The
-    file is replaced atomically in the same directory so inotify-based watchers
-    still fire (IN_MOVED_TO), and the result is re-parsed to guarantee a valid
-    loadout.
+
+def toml_quote(value: str) -> str:
+    """Quote a string as a TOML basic string value."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def rewrite_browser_state(path: Path, browser_number: int, percent: int, url: str) -> None:
+    """Set `url` and `scroll = "N%"` on the browser_numberth [[browser]] block.
+
+    Replaces the block's `url` line and its `scroll` line (or inserts either
+    missing one after the other), preserving every other line, comment, and blank
+    verbatim. The file is replaced atomically in the same directory so
+    inotify-based watchers still fire (IN_MOVED_TO), and the result is re-parsed
+    to guarantee a valid loadout.
     """
     try:
         original = path.read_text()
@@ -1349,14 +1364,21 @@ def rewrite_scroll(path: Path, browser_number: int, percent: int) -> None:
             scroll_index = i
         if url_index is None and re.match(r"^\s*url\s*=", lines[i]):
             url_index = i
-    value = f'scroll = "{percent}%"'
-    if scroll_index is not None:
-        indent = re.match(r"^\s*", lines[scroll_index]).group(0)
-        lines[scroll_index] = f"{indent}{value}"
+    ref = scroll_index if scroll_index is not None else url_index
+    indent = re.match(r"^\s*", lines[ref]).group(0) if ref is not None else re.match(r"^\s*", lines[block_start]).group(0)
+    url_value = f'url = "{toml_quote(url)}"'
+    scroll_value = f'scroll = "{percent}%"'
+    if url_index is None:
+        lines.insert(block_start + 1, f"{indent}{url_value}")
+        if scroll_index is not None:
+            scroll_index += 1
+        url_index = block_start + 1
     else:
-        target = url_index if url_index is not None else block_start
-        indent = re.match(r"^\s*", lines[target]).group(0)
-        lines.insert(target + 1, f"{indent}{value}")
+        lines[url_index] = f"{indent}{url_value}"
+    if scroll_index is not None:
+        lines[scroll_index] = f"{indent}{scroll_value}"
+    else:
+        lines.insert(url_index + 1, f"{indent}{scroll_value}")
     rewritten = "\n".join(lines) + ("\n" if original.endswith("\n") else "")
     try:
         path.write_text(rewritten)
@@ -1369,7 +1391,7 @@ def rewrite_scroll(path: Path, browser_number: int, percent: int) -> None:
             path.write_text(original)
         except OSError:
             pass
-        raise LoadoutError(f"rejected scroll line would corrupt {path}")
+        raise LoadoutError(f"rejected url/scroll lines would corrupt {path}")
 
 
 def emacs_plant(path: Path) -> str:

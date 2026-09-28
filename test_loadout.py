@@ -1288,9 +1288,25 @@ class SaveScrollTests(unittest.TestCase):
         socket = FakeSocket()
 
         def request(sock, buf, request_id, method, params=None, **kwargs):
-            return {"result": {"value": {"y": y, "max": max_height}}}, b""
+            return {"result": {"value": {"y": y, "max": max_height,
+                                          "url": "file:///tmp/doc.html"}}}, b""
 
         return response, socket, request
+
+    def test_browser_page_state_returns_url_and_percent(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            (profile / "DevToolsActivePort").write_text("9222\n")
+            entry = loadout.Entry("browser:0", "browser", "j", "doc",
+                                  Path(td), url="file:///tmp/doc.html")
+            response, fake_socket, request = self._scroll_response(1234, 3000)
+            with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+                 patch.object(loadout, "ws_connect",
+                              return_value=(fake_socket, b"")), \
+                 patch.object(loadout, "cdp_request", side_effect=request):
+                self.assertEqual(
+                    loadout.browser_page_state(profile, entry),
+                    (41, "file:///tmp/doc.html"))
 
     def test_page_scroll_percent_rounds_up(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1339,7 +1355,7 @@ class SaveScrollTests(unittest.TestCase):
                     profile,
                     loadout.Entry("browser:0", "browser", "j", "doc", Path(td)))
 
-    def test_rewrite_scroll_replaces_existing_line(self):
+    def test_rewrite_browser_state_replaces_url_and_scroll(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "loadout"
             path.write_text('''# a comment
@@ -1351,13 +1367,27 @@ scroll = "10%"
 [[terminal]]
 name = "sql"
 ''')
-            loadout.rewrite_scroll(path, 0, 62)
+            loadout.rewrite_browser_state(path, 0, 62, "https://example.org/new")
             text = path.read_text()
+            self.assertIn('url = "https://example.org/new"', text)
             self.assertIn('scroll = "62%"', text)
             self.assertNotIn('scroll = "10%"', text)
             self.assertTrue(text.startswith("# a comment\n[[browser]]\nurl"))
+            self.assertEqual(loadout.load_spec(path).entries[0].url, "https://example.org/new")
 
-    def test_rewrite_scroll_inserts_after_url(self):
+    def test_rewrite_browser_state_quotes_url(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "loadout"
+            path.write_text('''[[browser]]
+url = "file:///tmp/doc.html"
+name = "doc"
+''')
+            loadout.rewrite_browser_state(path, 0, 40, 'file:///x?a="b"\\c')
+            text = path.read_text()
+            self.assertIn(r'url = "file:///x?a=\"b\"\\c"', text)
+            self.assertEqual(loadout.load_spec(path).entries[0].url, 'file:///x?a="b"\\c')
+
+    def test_rewrite_browser_state_inserts_scroll_after_url(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "loadout"
             path.write_text('''[[browser]]
@@ -1367,11 +1397,11 @@ name = "doc"
 [[terminal]]
 name = "sql"
 ''')
-            loadout.rewrite_scroll(path, 0, 40)
+            loadout.rewrite_browser_state(path, 0, 40, "file:///tmp/doc.html")
             self.assertIn('url = "file:///tmp/doc.html"\nscroll = "40%"', path.read_text())
             self.assertTrue(loadout.load_spec(path).entries[0].scroll == "40%")
 
-    def test_rewrite_scroll_targets_second_browser_block(self):
+    def test_rewrite_browser_state_targets_second_browser_block(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "loadout"
             path.write_text('''[[browser]]
@@ -1386,13 +1416,15 @@ name = "sql"
 url = "file:///tmp/doc.html"
 name = "doc"
 ''')
-            loadout.rewrite_scroll(path, 1, 33)
+            loadout.rewrite_browser_state(path, 1, 33, "file:///tmp/doc.html#sec")
             text = path.read_text()
             self.assertNotIn("scroll = \"33%\"", text.split("[[browser]]")[1])
-            self.assertIn('file:///tmp/doc.html"\nscroll = "33%"', text)
+            self.assertIn('file:///tmp/doc.html#sec"\nscroll = "33%"', text)
             entries = loadout.load_spec(path).entries
             self.assertEqual(entries[0].scroll, None)
+            self.assertEqual(entries[0].url, "https://example.com")
             self.assertEqual(entries[1].scroll, "33%")
+            self.assertEqual(entries[1].url, "file:///tmp/doc.html#sec")
 
     def _save_flow(self, answer, ident="browser:0", focused=True):
         root = Path(tempfile.mkdtemp())
@@ -1414,21 +1446,23 @@ name = "doc"
         win, spec, root = self._save_flow("yes")
         with patch.object(loadout, "get_tree", return_value=self._tree_with(win)), \
              patch.object(loadout, "active_spec", return_value=spec), \
-             patch.object(loadout, "page_scroll_percent", return_value=55), \
+             patch.object(loadout, "browser_page_state",
+                          return_value=(55, "https://example.org/current")), \
              patch.object(loadout.subprocess, "run") as run, \
-             patch.object(loadout, "rewrite_scroll") as rewrite:
+             patch.object(loadout, "rewrite_browser_state") as rewrite:
             run.return_value.stdout = "yes"
             code = loadout.save_scroll()
         self.assertEqual(code, 0)
-        rewrite.assert_called_once_with(spec.source, 0, 55)
+        rewrite.assert_called_once_with(spec.source, 0, 55, "https://example.org/current")
 
     def test_save_scroll_no_skips_write(self):
         win, spec, root = self._save_flow("no")
         with patch.object(loadout, "get_tree", return_value=self._tree_with(win)), \
              patch.object(loadout, "active_spec", return_value=spec), \
-             patch.object(loadout, "page_scroll_percent", return_value=55), \
+             patch.object(loadout, "browser_page_state",
+                          return_value=(55, "https://example.org/current")), \
              patch.object(loadout.subprocess, "run") as run, \
-             patch.object(loadout, "rewrite_scroll") as rewrite:
+             patch.object(loadout, "rewrite_browser_state") as rewrite:
             run.return_value.stdout = "n"
             code = loadout.save_scroll()
         self.assertEqual(code, 0)
@@ -1438,7 +1472,7 @@ name = "doc"
         win, spec, root = self._save_flow("yes", ident="terminal:0", focused=False)
         with patch.object(loadout, "get_tree", return_value=self._tree_with(win)), \
              patch.object(loadout, "active_spec", return_value=spec), \
-             patch.object(loadout, "rewrite_scroll") as rewrite, \
+             patch.object(loadout, "rewrite_browser_state") as rewrite, \
              patch.object(loadout.subprocess, "run") as run:
             code = loadout.save_scroll()
         self.assertEqual(code, 1)

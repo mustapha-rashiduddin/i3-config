@@ -20,6 +20,8 @@ import tomllib
 from datetime import datetime
 from select import select
 
+import traywin
+
 CHROME_CFG = os.path.expanduser("~/.config/google-chrome")
 MARKER = os.path.expanduser("~/.config/i3/.chrome-launched")
 MARKER_WINDOW = 6.0
@@ -61,6 +63,7 @@ _focus_gen = 0
 _cached_tree = None
 _overlay_gen = 0
 _show_ws = False
+_tray_visible = True
 
 
 def run(cmd, timeout=3):
@@ -441,6 +444,9 @@ def _bg_status():
             else:
                 sample_status()
                 last_slow = _status_last_slow
+# re-assert the tray: a bar restart (config reload) or a new tray
+            # client re-docks the icons with the mapped flag set.
+            traywin.set_visible(not _show_ws)
             os.write(_refresh_pipe_w, b"\n")
         except Exception:
             pass
@@ -452,6 +458,17 @@ def show_ws():
         return os.path.getsize(SHOW_WS) > 0
     except OSError:
         return False
+
+
+def apply_tray():
+    """The tray belongs to the bar, not to the frames it prints, so the
+    workspace row has to hide the icons i3bar docked; see traywin.py."""
+    global _tray_visible
+    want = not _show_ws
+    if want == _tray_visible:
+        return
+    if traywin.set_visible(want):
+        _tray_visible = want
 
 
 def status_blocks():
@@ -624,6 +641,7 @@ def handle_event(line):
         # rather than on the next poll; the file is the state, the tick is
         # only the "look again now" nudge.
         _show_ws = show_ws()
+        apply_tray()
         return
     if change == "focus" and ev.get("current", {}).get("type") == "workspace":
         new_name = ev["current"].get("name", "")
@@ -718,6 +736,7 @@ def main():
     t = threading.Thread(target=_bg_refresh, daemon=True)
     t.start()
     sample_status()
+    traywin.set_visible(not _show_ws)
     st = threading.Thread(target=_bg_status, daemon=True)
     st.start()
 
@@ -865,6 +884,7 @@ def main():
                 # the tick is the fast path; one stat per poll is the backstop
                 if show_ws() != _show_ws:
                     _show_ws = show_ws()
+                    apply_tray()
                     emit()
         except Exception:
             time.sleep(1)

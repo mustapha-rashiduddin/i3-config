@@ -1,4 +1,5 @@
 __pycache__/
 .chrome-launched
+.show_ws
 window_names.json
 result

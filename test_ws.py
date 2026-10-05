@@ -1,5 +1,7 @@
 import copy
 import json
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -87,6 +89,85 @@ class WindowLabelTests(unittest.TestCase):
         }
 
         self.assertEqual(ws.collect_windows(node), ["te"])
+
+
+class ToggleTests(unittest.TestCase):
+    def setUp(self):
+        ws._show_ws = False
+        ws._status_lock = ("N/A", None)
+        ws._status_slow = []
+        ws._snapshot = {
+            "workspaces": [{"name": "j", "focused": True}],
+            "apps": {"j": []},
+            "loadout_keys": set(),
+            "screen_w": 0,
+        }
+
+    def with_toggle(self, contents):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(contents)
+            path = f.name
+        self.addCleanup(os.unlink, path)
+        p = patch.object(ws, "SHOW_WS", path)
+        p.start()
+        self.addCleanup(p.stop)
+        return path
+
+    def test_empty_toggle_keeps_workspaces_hidden(self):
+        self.with_toggle(b"")
+
+        self.assertFalse(ws.show_ws())
+
+    def test_toggle_with_content_shows_workspaces(self):
+        self.with_toggle(b"1")
+
+        self.assertTrue(ws.show_ws())
+
+    def test_missing_toggle_keeps_workspaces_hidden(self):
+        with patch.object(ws, "SHOW_WS", "/nonexistent/.show_ws"):
+            self.assertFalse(ws.show_ws())
+
+    def test_tick_flips_the_visible_mode(self):
+        self.with_toggle(b"1")
+
+        ws.handle_event(json.dumps({"change": "tick"}))
+
+        self.assertTrue(ws._show_ws)
+
+    def test_status_blocks_replace_the_workspace_row_when_hidden(self):
+        with patch.object(ws, "time_block", return_value="{ Monday } 05/10/2026 12:00:00"):
+            blocks = ws.render(ws.ROW_KEYS)
+
+        texts = [b["full_text"] for b in blocks]
+        self.assertEqual(texts[-1], "{ Monday } 05/10/2026 12:00:00")
+        self.assertEqual(texts[0], "N/A")
+
+    def test_workspace_boxes_render_when_shown(self):
+        ws._show_ws = True
+        ws._status_slow = []
+
+        blocks = ws.render(ws.ROW_KEYS)
+
+        self.assertEqual([b.get("name") for b in blocks[:len(ws.ROW_KEYS)]],
+                         [f"ws.{k}" for k in ws.ROW_KEYS])
+
+
+class LockStateTests(unittest.TestCase):
+    @patch.object(ws, "planted_db_root", return_value=None)
+    def test_mark_root_locks(self, planted):
+        tree = {"nodes": [{"nodes": [{"marks": ["loadout:/tmp/l"]}], "floating_nodes": []}]}
+
+        self.assertEqual(ws.lock_state(tree), ("LOCKED", "/tmp/l"))
+
+    def test_planted_root_unlocks(self):
+        with tempfile.TemporaryDirectory() as root:
+            open(os.path.join(root, "loadout"), "w").close()
+            with patch.object(ws, "planted_db_root", return_value=root):
+                self.assertEqual(ws.lock_state(None), ("UNLOCKED", root))
+
+    @patch.object(ws, "planted_db_root", return_value=None)
+    def test_nothing_engaged_is_na(self, planted):
+        self.assertEqual(ws.lock_state(None), ("N/A", None))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""The one bar, at the bottom: workspace buttons behind a toggle, else system
+status (lock, volume, battery, memory, disk, load, clock).
+
+`toggle-ws.sh` writes SHOW_WS and pokes a tick, so the workspace row appears on
+the next emit instead of waiting out the poll. The status blocks are sampled by
+a background thread (every SLOW_INTERVAL, plus the lock block on mark/speed-dial
+changes) so they never sit in the latency path of a workspace switch.
+"""
 import ctypes
 import fcntl
 import json
@@ -9,6 +17,7 @@ import sys
 import threading
 import time
 import tomllib
+from datetime import datetime
 from select import select
 
 CHROME_CFG = os.path.expanduser("~/.config/google-chrome")
@@ -16,6 +25,11 @@ MARKER = os.path.expanduser("~/.config/i3/.chrome-launched")
 MARKER_WINDOW = 6.0
 OVERLAY = os.path.expanduser("~/.config/i3/window_names.json")
 RENAME_PIPE = os.path.expanduser("~/.config/i3/.rename_pipe")
+SHOW_WS = os.path.expanduser("~/.config/i3/.show_ws")
+SD_DB = os.path.expanduser("~/emacs-speed-dial/speed-dial.sqlite")
+BAT_FLASH_COLOR = "#ff0000"
+LOCK_COLOR = "#00ff00"
+UNLOCK_COLOR = "#ff5252"
 _prof_cache = {}
 _win_profiles = {}
 _name_overlay = {}
@@ -38,10 +52,15 @@ _snapshot = {
 }
 _refresh_event = threading.Event()
 _refresh_pipe_r, _refresh_pipe_w = os.pipe()
+_status_wake = threading.Event()
+_status_lock = ("N/A", None)
+_status_slow = []
+_status_last_slow = 0.0
 _last_focused = None
 _focus_gen = 0
 _cached_tree = None
 _overlay_gen = 0
+_show_ws = False
 
 
 def run(cmd, timeout=3):
@@ -256,11 +275,11 @@ def _parse_loadout_slots(path):
     return used
 
 
-def loadout_keys(tree):
-    """Workspace keys used by the engaged loadout(s), green in the bar.
+def loadout_roots(tree):
+    """Directories of the loadouts currently engaged in i3, from their marks.
 
     The engaged loadout root lives in i3's RAM as the `loadout:<root>` marks
-    carried by its windows; everything is red unless such a loadout exists.
+    carried by its windows; everything else reads UNLOCKED from disk.
     """
     roots = set()
     if tree:
@@ -270,14 +289,190 @@ def loadout_keys(tree):
                     root = m[len(LOADOUT_MARK):]
                     if root:
                         roots.add(root)
+    return roots
+
+
+def loadout_keys(tree):
+    """Workspace keys used by the engaged loadout(s), green in the bar."""
     keys = set()
-    for root in sorted(roots):
+    for root in sorted(loadout_roots(tree)):
         for name in ("loadout", "loadout.toml"):
             path = os.path.join(root, name)
             if os.path.isfile(path):
                 keys |= _parse_loadout_slots(path)
                 break
     return keys
+
+
+def vol_block():
+    v = run(["pamixer", "--get-volume"])
+    muted = run(["pamixer", "--get-mute"]) == "true"
+    if not v:
+        return "♪: ?"
+    return f"♪: muted ({v}%)" if muted else f"♪: {v}%"
+
+
+def bat_percent():
+    try:
+        with open("/sys/class/power_supply/BAT0/capacity") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def bat_charging():
+    try:
+        with open("/sys/class/power_supply/BAT0/status") as f:
+            return f.read().strip() != "Discharging"
+    except Exception:
+        return None
+
+
+def bat_block():
+    cap = bat_percent()
+    if cap is None:
+        return "BAT: ?"
+    try:
+        with open("/sys/class/power_supply/BAT0/status") as f:
+            st = f.read().strip()
+    except Exception:
+        return "BAT: ?"
+    if st == "Charging":
+        icon = "⚡ CHR"
+    elif st == "Full":
+        icon = "█ FULL"
+    else:
+        icon = "🔋 BAT"
+    return f"{icon} {cap}%"
+
+
+def mem_block():
+    out = run(["free", "-h"])
+    for line in out.splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 7 and f[0].startswith("Mem"):
+            return f"{f[2]} | {f[6]}"
+    return "MEM: ?"
+
+
+def mem_available_mb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        return None
+    return None
+
+
+def disk_block():
+    out = run(["df", "-P", "-h", "/"])
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 6 and f[0] != "Filesystem":
+            return f[3]
+    return "DISK: ?"
+
+
+def load_block():
+    try:
+        with open("/proc/loadavg") as f:
+            return f.read().split()[0]
+    except Exception:
+        return "?"
+
+
+def time_block():
+    return datetime.now().strftime("{ %A } %d/%m/%Y %H:%M:%S")
+
+
+SLOW_FUNCS = (vol_block, bat_block, mem_block, disk_block, load_block)
+SLOW_INTERVAL = 5.0
+_BAT_IDX = SLOW_FUNCS.index(bat_block)
+_MEM_IDX = SLOW_FUNCS.index(mem_block)
+
+
+def planted_db_root():
+    if not os.path.isfile(SD_DB):
+        return None
+    out = run(["sqlite3", SD_DB,
+               "SELECT value FROM state WHERE key='global_workspace'"])
+    if not out:
+        return None
+    return out.splitlines()[0]
+
+
+def lock_state(tree):
+    """(state, root) — LOCKED with the engaged loadout's directory, else
+    UNLOCKED with the planted loadout directory, else "N/A" without a root."""
+    roots = loadout_roots(tree)
+    if roots:
+        return "LOCKED", sorted(roots)[0]
+    root = planted_db_root()
+    if root and (os.path.isfile(os.path.join(root, "loadout"))
+                 or os.path.isfile(os.path.join(root, "loadout.toml"))):
+        return "UNLOCKED", root
+    return "N/A", None
+
+
+def sample_status():
+    """One slow pass: the polled blocks plus the lock block. Called once before
+    the first emit so the bar never paints with half its status missing."""
+    global _status_lock, _status_slow, _status_last_slow
+    _status_slow = [fn() for fn in SLOW_FUNCS]
+    _status_lock = lock_state(_cached_tree)
+    _status_last_slow = time.time()
+
+
+def _bg_status():
+    global _status_lock
+    last_slow = _status_last_slow
+    while True:
+        _status_wake.wait(timeout=max(SLOW_INTERVAL - (time.time() - last_slow), 0.0))
+        forced = _status_wake.is_set()
+        _status_wake.clear()
+        now = time.time()
+        if not forced and now - last_slow < SLOW_INTERVAL:
+            continue
+        try:
+            if forced and now - last_slow < SLOW_INTERVAL:
+                _status_lock = lock_state(_cached_tree)
+            else:
+                sample_status()
+                last_slow = _status_last_slow
+            os.write(_refresh_pipe_w, b"\n")
+        except Exception:
+            pass
+
+
+def show_ws():
+    """The workspace row shows whenever the toggle file has any content."""
+    try:
+        return os.path.getsize(SHOW_WS) > 0
+    except OSError:
+        return False
+
+
+def status_blocks():
+    state, root = _status_lock
+    blocks = [{
+        "full_text": f"{root} {state.lower()}" if root else "N/A",
+        "color": LOCK_COLOR if state == "LOCKED" else UNLOCK_COLOR,
+    }]
+    on_second = int(time.time()) % 2
+    cap = bat_percent()
+    low_bat = cap is not None and cap < 15 and not bat_charging()
+    avail = mem_available_mb()
+    low_mem = avail is not None and avail <= 800
+    for idx, block in enumerate(_status_slow):
+        item = {"full_text": block if block is not None else ""}
+        flash = ((idx == _BAT_IDX and low_bat) or (idx == _MEM_IDX and low_mem))
+        if flash and on_second:
+            item["color"] = BAT_FLASH_COLOR
+        blocks.append(item)
+    blocks.append({"full_text": time_block()})
+    return blocks
 
 
 def truncate(label, width):
@@ -373,6 +568,8 @@ def _bg_refresh():
 
 
 def render(row_keys):
+    if not _show_ws:
+        return status_blocks()
     snap = _snapshot
     workspaces = snap["workspaces"]
     ws_by_name = {ws.get("name"): ws for ws in workspaces}
@@ -416,12 +613,18 @@ def render(row_keys):
 
 
 def handle_event(line):
-    global _cached_tree, _focus_gen, _overlay_gen
+    global _cached_tree, _focus_gen, _overlay_gen, _show_ws
     try:
         ev = json.loads(line)
     except Exception:
         return
     change = ev.get("change")
+    if change == "tick":
+        # toggle-ws.sh pokes a tick so the workspace row flips on this emit
+        # rather than on the next poll; the file is the state, the tick is
+        # only the "look again now" nudge.
+        _show_ws = show_ws()
+        return
     if change == "focus" and ev.get("current", {}).get("type") == "workspace":
         new_name = ev["current"].get("name", "")
         if new_name:
@@ -443,6 +646,7 @@ def handle_event(line):
         # immediately instead of waiting for the 1s poll so workspace buttons
         # flip green/red the moment marks are added or cleared.
         _refresh_event.set()
+        _status_wake.set()
         return
     c = ev.get("container") or {}
     xid = c.get("window")
@@ -506,11 +710,16 @@ def handle_click(line):
 
 
 def main():
+    global _show_ws
     load_overlay()
     _refresh()
+    _show_ws = show_ws()
 
     t = threading.Thread(target=_bg_refresh, daemon=True)
     t.start()
+    sample_status()
+    st = threading.Thread(target=_bg_status, daemon=True)
+    st.start()
 
     first = True
 
@@ -541,6 +750,7 @@ def main():
         refresh_fd = os.fdopen(_refresh_pipe_r, "rb", buffering=0, closefd=False)
         try:
             inotify_fd = None
+            db_fd = None
             try:
                 _libc = ctypes.CDLL("libc.so.6")
                 _inotify_fd = _libc.inotify_init()
@@ -550,9 +760,24 @@ def main():
                 inotify_fd = _inotify_fd
             except Exception:
                 pass
+            try:
+                # plant rewrites the speed-dial sqlite in place, which closes
+                # with IN_CLOSE_WRITE; a whole-DB replace shows up on the dir.
+                _db_inotify_fd = _libc.inotify_init()
+                _libc.inotify_add_watch(_db_inotify_fd,
+                                        os.path.abspath(SD_DB).encode(),
+                                        0x00000008)
+                _libc.inotify_add_watch(_db_inotify_fd,
+                                        os.path.abspath(SD_DB).parent.encode(),
+                                        0x00000008 | 0x00000100 | 0x00000200)
+                db_fd = _db_inotify_fd
+            except Exception:
+                pass
             fds = [proc.stdout, sys.stdin, refresh_fd]
             if inotify_fd is not None:
                 fds.append(inotify_fd)
+            if db_fd is not None:
+                fds.append(db_fd)
             rename_file = None
             try:
                 rename_file = os.fdopen(os.open(RENAME_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb", buffering=0)
@@ -591,6 +816,12 @@ def main():
                     load_overlay()
                     _rebuild_apps()
                     emit()
+                if db_fd is not None and db_fd in ready:
+                    try:
+                        os.read(db_fd, 4096)
+                    except OSError:
+                        pass
+                    _status_wake.set()
                 if sys.stdin in ready:
                     try:
                         in_buf += os.read(sys.stdin.fileno(), 4096).decode(errors="replace")
@@ -631,6 +862,10 @@ def main():
                             save_overlay()
                             _rebuild_apps()
                             emit()
+                # the tick is the fast path; one stat per poll is the backstop
+                if show_ws() != _show_ws:
+                    _show_ws = show_ws()
+                    emit()
         except Exception:
             time.sleep(1)
         proc.wait()

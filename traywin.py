@@ -31,6 +31,36 @@ class _X11Hint(ctypes.Structure):
     ]
 
 
+class _XWindowAttributes(ctypes.Structure):
+    # The whole struct, not just the fields read here: XGetWindowAttributes
+    # writes every one of them, and a short struct is a heap corruption.
+    _fields_ = [
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int),
+        ("depth", ctypes.c_int),
+        ("visual", ctypes.c_void_p),
+        ("root", ctypes.c_ulong),
+        ("class", ctypes.c_int),
+        ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int),
+        ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong),
+        ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int),
+        ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int),
+        ("map_state", ctypes.c_int),
+        ("all_event_masks", ctypes.c_long),
+        ("your_event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int),
+        ("screen", ctypes.c_void_p),
+    ]
+
+
 _lib = None
 
 
@@ -64,6 +94,9 @@ def lib():
         lib.XGetClassHint.restype = ctypes.c_int
         lib.XGetClassHint.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
                                       ctypes.POINTER(_X11Hint)]
+        lib.XGetWindowAttributes.restype = ctypes.c_int
+        lib.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                             ctypes.POINTER(_XWindowAttributes)]
         lib.XInternAtom.restype = ctypes.c_ulong
         lib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
                                     ctypes.c_int]
@@ -130,6 +163,50 @@ def tray_windows(dpy):
         out.extend(child for child in _children(dpy, bar)
                    if _klass(dpy, child) != "i3bar")
     return out
+
+
+def _geometry(dpy, window):
+    """(x, y, width, height, map_state) or None for a window that is gone."""
+    attrs = _XWindowAttributes()
+    if not _lib.XGetWindowAttributes(dpy, window, ctypes.byref(attrs)):
+        return None
+    return (attrs.x, attrs.y, attrs.width, attrs.height, attrs.map_state)
+
+
+def reserved_width():
+    """How much of the bar i3bar's tray takes up, as it lays it out.
+
+    i3bar pins the rightmost icon at bar_width - (clients * (icon_size +
+    tray_padding)) and hands the statusline the rest, so the tray's left edge
+    (the leftmost mapped icon) is exactly the width to keep out of the line.
+    Unmapped icons -- the ones traywin.set_visible(False) hides -- do not count
+    towards i3bar's tray width either.
+    """
+    if lib() is None:
+        return 0
+    dpy = _lib.XOpenDisplay(None)
+    if not dpy:
+        return 0
+    try:
+        reserved = 0
+        for bar in _bar_windows(dpy):
+            bar_geom = _geometry(dpy, bar)
+            if not bar_geom:
+                continue
+            bar_w = bar_geom[2]
+            left = None
+            for client in _children(dpy, bar):
+                geom = _geometry(dpy, client)
+                if not geom or geom[4] != 2:  # IsViewable
+                    continue
+                left = geom[0] if left is None else min(left, geom[0])
+            if left is not None:
+                reserved = max(reserved, bar_w - left)
+        return reserved
+    except Exception:
+        return 0
+    finally:
+        _lib.XCloseDisplay(dpy)
 
 
 def set_visible(visible):

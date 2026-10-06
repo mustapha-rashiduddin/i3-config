@@ -134,22 +134,60 @@ class ToggleTests(unittest.TestCase):
 
         self.assertTrue(ws._show_ws)
 
+    def buttons(self, blocks):
+        return [b for b in blocks if b.get("name")]
+
     def test_status_blocks_replace_the_workspace_row_when_hidden(self):
         with patch.object(ws, "time_block", return_value="{ Monday } 05/10/2026 12:00:00"):
             blocks = ws.render(ws.ROW_KEYS)
 
-        texts = [b["full_text"] for b in blocks]
-        self.assertEqual(texts[-1], "{ Monday } 05/10/2026 12:00:00")
-        self.assertEqual(texts[0], "N/A")
+        self.assertEqual(blocks[-1]["full_text"], "{ Monday } 05/10/2026 12:00:00")
+        self.assertNotIn(ws.BOX_WIDTH, [b.get("min_width") for b in blocks])
+
+    def test_status_frame_is_the_buttons_then_the_system_blocks(self):
+        with patch.object(ws, "time_block", return_value="clock"):
+            blocks = ws.render(ws.ROW_KEYS)
+            system = ws.system_blocks()
+
+        self.assertEqual(blocks[-len(system):], system)
+        self.assertEqual([b["name"] for b in self.buttons(blocks)], ["ws.j"])
+
+    def test_status_mode_draws_small_stock_workspace_buttons(self):
+        ws._snapshot["workspaces"] = [{"name": "j", "focused": True},
+                                      {"name": "l"}]
+
+        buttons = self.buttons(ws.render(ws.ROW_KEYS))
+
+        self.assertEqual([b["full_text"] for b in buttons], ["j", "l"])
+        self.assertEqual([b["min_width"] for b in buttons],
+                         [ws.WS_BUTTON_W] * 2)
+        self.assertEqual([b["background"] for b in buttons],
+                         [ws.WS_BG[ws.WS_FOCUSED], ws.WS_BG[ws.WS_IDLE]])
+
+    def test_workspaces_without_a_window_are_not_drawn(self):
+        ws._snapshot["workspaces"] = [{"name": "j", "focused": True}]
+
+        buttons = self.buttons(ws.render(ws.ROW_KEYS))
+
+        self.assertEqual([b["full_text"] for b in buttons], ["j"])
+
+    def test_urgent_workspace_button_uses_the_stock_urgent_color(self):
+        ws._snapshot["workspaces"] = [{"name": "j", "focused": True},
+                                      {"name": "k", "urgent": True}]
+
+        buttons = self.buttons(ws.render(ws.ROW_KEYS))
+
+        self.assertEqual(buttons[1]["background"], ws.WS_BG[ws.WS_URGENT])
 
     def test_workspace_boxes_render_when_shown(self):
         ws._show_ws = True
-        ws._status_slow = []
 
         blocks = ws.render(ws.ROW_KEYS)
 
         self.assertEqual([b.get("name") for b in blocks[:len(ws.ROW_KEYS)]],
                          [f"ws.{k}" for k in ws.ROW_KEYS])
+        self.assertEqual([b.get("min_width") for b in blocks[:len(ws.ROW_KEYS)]],
+                         [ws.BOX_WIDTH] * len(ws.ROW_KEYS))
 
 
 class LockStateTests(unittest.TestCase):

@@ -21,6 +21,7 @@ from datetime import datetime
 from select import select
 
 import traywin
+import textwidth
 
 CHROME_CFG = os.path.expanduser("~/.config/google-chrome")
 MARKER = os.path.expanduser("~/.config/i3/.chrome-launched")
@@ -395,6 +396,22 @@ SLOW_INTERVAL = 5.0
 _BAT_IDX = SLOW_FUNCS.index(bat_block)
 _MEM_IDX = SLOW_FUNCS.index(mem_block)
 
+# i3bar's stock workspace button colors (i3bar/src/xcb.c colors), so the status
+# frame's buttons are indistinguishable from the built-in ones.
+WS_FG = ("#ffffff", "#ffffff", "#888888")
+WS_BG = ("#285577", "#900000", "#222222")
+WS_FOCUSED, WS_URGENT, WS_IDLE = range(3)
+WS_BUTTON_W = 22
+BAR_FONT = "monospace 14"  # the config's `font pango:monospace 14`, stripped
+_metrics = None
+
+
+def metrics():
+    global _metrics
+    if _metrics is None:
+        _metrics = textwidth.Metrics(BAR_FONT)
+    return _metrics
+
 
 def planted_db_root():
     if not os.path.isfile(SD_DB):
@@ -471,7 +488,86 @@ def apply_tray():
         _tray_visible = want
 
 
+def workspace_buttons():
+    """Stock i3 workspace buttons for the status frame.
+
+    i3bar draws its own buttons for the whole bar (`workspace_buttons`), which
+    would show them in the workspace frame too, where ws.py already draws its
+    own boxes -- so the status frame draws its own set instead, clickable
+    through the same ws.<key> click events. Like the built-in ones, one button
+    per workspace that exists, no gaps between them.
+    """
+    ws_by_name = {ws.get("name"): ws for ws in _snapshot["workspaces"]}
+    blocks = []
+    for key in ROW_KEYS:
+        ws = ws_by_name.get(key)
+        if not ws:
+            continue
+        focused = ws.get("focused") or _last_focused == key
+        state = WS_FOCUSED if focused else (
+            WS_URGENT if ws.get("urgent") else WS_IDLE)
+        blocks.append({
+            "full_text": key,
+            "name": f"ws.{key}",
+            "instance": key,
+            "align": "center",
+            "separator": False,
+            "separator_block_width": 0,
+            "min_width": WS_BUTTON_W,
+            "background": WS_BG[state],
+            "color": WS_FG[state],
+        })
+    return blocks
+
+
+def _block_width(block, m):
+    """How wide i3bar draws a block: min_width wins over the text width."""
+    return max(m.width(block.get("full_text") or ""),
+               block.get("min_width") or 0)
+
+
+def _block_sep(block, m):
+    return block.get("separator_block_width", m.separator())
+
+
+def filler(buttons, system, screen_w):
+    """Pad the line out to the bar's width, between the buttons and the system
+    blocks.
+
+    i3bar right-aligns the status command's blocks (x_dest = rect.w - tray -
+    gap - statusline_width), so a line narrower than the bar leaves the left
+    edge empty. It counts a line as every block's width plus a separator block
+    after all but the last, and it reserves the tray's width plus a gap, so the
+    status blocks stay flush right while the buttons sit at x = 0. A block with
+    empty text gets no width at all, hence the space.
+    """
+    m = metrics()
+    if not m.ok or not screen_w:
+        return None
+    tray = traywin.reserved_width()
+    available = screen_w - tray - (m.statusline_tray_gap() if tray else 0)
+    used = sum(_block_width(b, m) + _block_sep(b, m) for b in buttons)
+    used += m.separator()  # the separator after the filler itself
+    for i, block in enumerate(system):
+        used += _block_width(block, m)
+        if i < len(system) - 1:
+            used += _block_sep(block, m)
+    return {
+        "full_text": " ",
+        "separator": False,
+        "align": "left",
+        "min_width": max(available - used, 0),
+    }
+
+
 def status_blocks():
+    buttons = workspace_buttons()
+    system = system_blocks()
+    pad = filler(buttons, system, _snapshot.get("screen_w") or 0)
+    return buttons + ([pad] if pad else []) + system
+
+
+def system_blocks():
     state, root = _status_lock
     blocks = [{
         "full_text": f"{root} {state.lower()}" if root else "N/A",

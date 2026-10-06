@@ -162,7 +162,7 @@ class ToggleTests(unittest.TestCase):
         self.assertEqual([b["min_width"] for b in buttons],
                          [ws.WS_BUTTON_W] * 2)
         self.assertEqual([b["background"] for b in buttons],
-                         [ws.WS_BG[ws.WS_FOCUSED], ws.WS_BG[ws.WS_IDLE]])
+                         [ws.WS_BG["focus"], ws.WS_BG["idle"]])
 
     def test_workspaces_without_a_window_are_not_drawn(self):
         ws._snapshot["workspaces"] = [{"name": "j", "focused": True}]
@@ -177,7 +177,31 @@ class ToggleTests(unittest.TestCase):
 
         buttons = self.buttons(ws.render(ws.ROW_KEYS))
 
-        self.assertEqual(buttons[1]["background"], ws.WS_BG[ws.WS_URGENT])
+        self.assertEqual(buttons[1]["background"], ws.WS_BG["urgent"])
+
+    def test_loadout_workspaces_are_green_instead_of_blue(self):
+        ws._snapshot["workspaces"] = [{"name": "j", "focused": True},
+                                      {"name": "k"}, {"name": "l"}]
+        ws._snapshot["loadout_keys"] = {"j", "l"}
+
+        buttons = self.buttons(ws.render(ws.ROW_KEYS))
+
+        self.assertEqual([b["background"] for b in buttons],
+                         [ws.WS_BG["locked_focus"], ws.WS_BG["idle"],
+                          ws.WS_BG["idle"]])
+        self.assertEqual([b["color"] for b in buttons],
+                         [ws.WS_FG["focus"], ws.WS_FG["idle"],
+                          ws.WS_FG["locked_idle"]])
+
+    def test_urgent_beats_the_loadout_green(self):
+        ws._snapshot["workspaces"] = [{"name": "j", "focused": True},
+                                      {"name": "k", "urgent": True}]
+        ws._snapshot["loadout_keys"] = {"j", "k"}
+
+        buttons = self.buttons(ws.render(ws.ROW_KEYS))
+
+        self.assertEqual([b["background"] for b in buttons],
+                         [ws.WS_BG["locked_focus"], ws.WS_BG["urgent"]])
 
     def test_workspace_boxes_render_when_shown(self):
         ws._show_ws = True

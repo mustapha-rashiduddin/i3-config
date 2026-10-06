@@ -397,10 +397,21 @@ _BAT_IDX = SLOW_FUNCS.index(bat_block)
 _MEM_IDX = SLOW_FUNCS.index(mem_block)
 
 # i3bar's stock workspace button colors (i3bar/src/xcb.c colors), so the status
-# frame's buttons are indistinguishable from the built-in ones.
-WS_FG = ("#ffffff", "#ffffff", "#888888")
-WS_BG = ("#285577", "#900000", "#222222")
-WS_FOCUSED, WS_URGENT, WS_IDLE = range(3)
+# frame's buttons are indistinguishable from the built-in ones -- except the
+# loadout's own slots, which the workspace row already paints green and keep
+# painting green here.
+WS_BG = {
+    "focus": "#285577",          # i3bar focus_ws_bg
+    "urgent": "#900000",         # i3bar urgent_ws_bg
+    "idle": "#222222",           # i3bar inactive_ws_bg
+    "locked_focus": "#009900",   # the workspace row's focused green
+}
+WS_FG = {
+    "focus": "#ffffff",
+    "urgent": "#ffffff",
+    "idle": "#888888",           # i3bar inactive_ws_fg
+    "locked_idle": "#00ff00",    # the workspace row's unlocked-workspace green
+}
 WS_BUTTON_W = 22
 BAR_FONT = "monospace 14"  # the config's `font pango:monospace 14`, stripped
 _metrics = None
@@ -496,16 +507,27 @@ def workspace_buttons():
     own boxes -- so the status frame draws its own set instead, clickable
     through the same ws.<key> click events. Like the built-in ones, one button
     per workspace that exists, no gaps between them.
+
+    The workspaces the engaged loadout claims (the ones the workspace row paints
+    green) are green here too, so the lock state reads the same in both frames.
     """
     ws_by_name = {ws.get("name"): ws for ws in _snapshot["workspaces"]}
+    loadout_keys = _snapshot.get("loadout_keys") or set()
     blocks = []
     for key in ROW_KEYS:
         ws = ws_by_name.get(key)
         if not ws:
             continue
+        locked = key in loadout_keys
         focused = ws.get("focused") or _last_focused == key
-        state = WS_FOCUSED if focused else (
-            WS_URGENT if ws.get("urgent") else WS_IDLE)
+        if ws.get("urgent"):
+            bg, fg = WS_BG["urgent"], WS_FG["urgent"]
+        elif focused:
+            bg = WS_BG["locked_focus"] if locked else WS_BG["focus"]
+            fg = WS_FG["focus"]
+        else:
+            bg = WS_BG["idle"]
+            fg = WS_FG["locked_idle"] if locked else WS_FG["idle"]
         blocks.append({
             "full_text": key,
             "name": f"ws.{key}",
@@ -514,8 +536,8 @@ def workspace_buttons():
             "separator": False,
             "separator_block_width": 0,
             "min_width": WS_BUTTON_W,
-            "background": WS_BG[state],
-            "color": WS_FG[state],
+            "background": bg,
+            "color": fg,
         })
     return blocks
 

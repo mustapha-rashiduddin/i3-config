@@ -18,6 +18,8 @@ import ctypes
 import ctypes.util
 import glob
 
+TRAY_LOFF_PX = 2  # i3bar's tray_loff_px, added on top of the icons' width
+
 XA_CARDINAL = 6  # Xatom.h
 _XEMBED_MAPPED = 1
 
@@ -176,11 +178,11 @@ def _geometry(dpy, window):
 def reserved_width():
     """How much of the bar i3bar's tray takes up, as it lays it out.
 
-    i3bar pins the rightmost icon at bar_width - (clients * (icon_size +
-    tray_padding)) and hands the statusline the rest, so the tray's left edge
-    (the leftmost mapped icon) is exactly the width to keep out of the line.
-    Unmapped icons -- the ones traywin.set_visible(False) hides -- do not count
-    towards i3bar's tray width either.
+    i3bar gives the statusline rect.w - tray_width - a small gap, and
+    get_tray_width() is every mapped icon plus tray_padding each, plus
+    tray_loff_px (2) once the tray is non-empty (i3bar/src/xcb.c). The icons
+    themselves are laid out right to left, so the leftmost mapped icon's x is
+    the tray's left edge minus that loff.
     """
     if lib() is None:
         return 0
@@ -193,7 +195,6 @@ def reserved_width():
             bar_geom = _geometry(dpy, bar)
             if not bar_geom:
                 continue
-            bar_w = bar_geom[2]
             left = None
             for client in _children(dpy, bar):
                 geom = _geometry(dpy, client)
@@ -201,7 +202,7 @@ def reserved_width():
                     continue
                 left = geom[0] if left is None else min(left, geom[0])
             if left is not None:
-                reserved = max(reserved, bar_w - left)
+                reserved = max(reserved, bar_geom[2] - left + TRAY_LOFF_PX)
         return reserved
     except Exception:
         return 0

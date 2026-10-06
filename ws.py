@@ -556,6 +556,9 @@ def filler(buttons, system, screen_w):
         "full_text": " ",
         "separator": False,
         "align": "left",
+        # Explicit: a backgroundless block behind one that has a background
+        # comes out painted in that background, which floods the whole line.
+        "background": "#000000",
         "min_width": max(available - used, 0),
     }
 

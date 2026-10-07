@@ -17,11 +17,26 @@ nothing has to be re-docked on the way back and the apps keep running.
 import ctypes
 import ctypes.util
 import glob
+import time
 
 TRAY_LOFF_PX = 2  # i3bar's tray_loff_px, added on top of the icons' width
+CACHE_TTL = 1.0   # the tray's width only moves when the tray's icons do
 
 XA_CARDINAL = 6  # Xatom.h
 _XEMBED_MAPPED = 1
+
+# libX11's default error handler prints the protocol error and calls exit(1)
+# (src/XError.c: _XDefaultError), which no Python try/except can intercept -- one
+# BadWindow from a window that died between listing it and asking about it is
+# enough to kill the bar's status command, and i3bar never respawns it. Every
+# walk below is a list-then-ask, so a window dying under us is ordinary, not
+# exceptional: swallow protocol errors and let the calls answer 0 for "gone".
+_XERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+
+@_XERROR_HANDLER
+def _ignore_error(_dpy, _event):
+    return 0
 
 
 class _X11Hint(ctypes.Structure):
@@ -64,6 +79,7 @@ class _XWindowAttributes(ctypes.Structure):
 
 
 _lib = None
+_cache = None  # (measured_at, width)
 
 
 def lib():
@@ -109,6 +125,15 @@ def lib():
                                         ctypes.c_int]
         lib.XFree.argtypes = [ctypes.c_void_p]
         lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.XInitThreads.restype = ctypes.c_int
+        lib.XInitThreads.argtypes = []
+        lib.XSetErrorHandler.restype = ctypes.c_void_p
+        lib.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+        # ws.py asks for the tray width from its main thread and re-asserts the
+        # mapped flag from the status thread, so Xlib has to be told the process
+        # is multithreaded before the first call.
+        lib.XInitThreads()
+        lib.XSetErrorHandler(_ignore_error)
         _lib = lib
         return _lib
     return None
@@ -175,20 +200,13 @@ def _geometry(dpy, window):
     return (attrs.x, attrs.y, attrs.width, attrs.height, attrs.map_state)
 
 
-def reserved_width():
-    """How much of the bar i3bar's tray takes up, as it lays it out.
-
-    i3bar gives the statusline rect.w - tray_width - a small gap, and
-    get_tray_width() is every mapped icon plus tray_padding each, plus
-    tray_loff_px (2) once the tray is non-empty (i3bar/src/xcb.c). The icons
-    themselves are laid out right to left, so the leftmost mapped icon's x is
-    the tray's left edge minus that loff.
-    """
+def _measure_reserved():
+    """The tray's width in pixels, or None when it cannot be measured now."""
     if lib() is None:
-        return 0
+        return None
     dpy = _lib.XOpenDisplay(None)
     if not dpy:
-        return 0
+        return None
     try:
         reserved = 0
         for bar in _bar_windows(dpy):
@@ -205,9 +223,40 @@ def reserved_width():
                 reserved = max(reserved, bar_geom[2] - left + TRAY_LOFF_PX)
         return reserved
     except Exception:
-        return 0
+        return None
     finally:
         _lib.XCloseDisplay(dpy)
+
+
+def forget_reserved_width():
+    """Drop the cached width: the icons just moved, or the bar was re-docked."""
+    global _cache
+    _cache = None
+
+
+def reserved_width(ttl=CACHE_TTL):
+    """How much of the bar i3bar's tray takes up, as it lays it out.
+
+    i3bar gives the statusline rect.w - tray_width - a small gap, and
+    get_tray_width() is every mapped icon plus tray_padding each, plus
+    tray_loff_px (2) once the tray is non-empty (i3bar/src/xcb.c). The icons
+    themselves are laid out right to left, so the leftmost mapped icon's x is
+    the tray's left edge minus that loff.
+
+    ws.py asks for this on every status frame, and measuring it costs a display
+    connection plus a round trip per window on the way to the bar, so the answer
+    is cached: the tray's width cannot change between frames unless the tray
+    does, and nothing walks the tree on the render path then. Pass ttl=0 to
+    force a fresh measurement.
+    """
+    global _cache
+    if _cache is not None and time.monotonic() - _cache[0] < ttl:
+        return _cache[1]
+    measured = _measure_reserved()
+    if measured is None:
+        return 0
+    _cache = (time.monotonic(), measured)
+    return measured
 
 
 def set_visible(visible):
@@ -225,6 +274,8 @@ def set_visible(visible):
             _lib.XChangeProperty(dpy, window, prop, XA_CARDINAL, 32,
                                  0, value, 2, 0)
         _lib.XSync(dpy, False)
+        if windows:
+            forget_reserved_width()
         return bool(windows)
     except Exception:
         return False

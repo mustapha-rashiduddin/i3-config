@@ -8,6 +8,7 @@
 - **Subprocess spawning is the silent killer.** Each `subprocess.run()` costs ~30-50ms on NixOS for fork+exec alone. Four calls = 200ms+ of dead time. Eliminate subprocess calls from critical paths entirely.
 - **Python startup is expensive.** The interpreter alone costs ~50-100ms. For latency-critical scripts, use shell or compiled tools.
 - **Move work out of the critical path.** Never make the user wait for work they don't need to see. Do lookups before the action, saves after via async mechanisms (pipes, inotify).
+- **Don't measure the bar's geometry per frame.** The status frame needs the tray's reserved width, and measuring it costs an X display connection plus a round trip per top-level window on the way to the bar: ~1.5ms and 33 requests per emit. The tray's width cannot change between frames unless the tray does, so cache it (see `traywin.reserved_width`).
 
 ### Race Conditions
 
@@ -16,6 +17,8 @@
 - **In-place mutation + atomic snapshot swap.** Main thread patches dicts directly (fast). Background thread builds a new snapshot and swaps it atomically. Prevents tearing.
 - **Cross-filesystem `mv` doesn't trigger inotify reliably.** `/tmp` to home directory = copy+delete, not rename. `IN_MOVED_TO` may not fire. Use same-directory temp files for inotify-based refresh.
 - **Test assumptions, don't trust docs.** `i3-msg nop` does not generate tick events. Raw IPC socket ticks don't deliver to subscribers. Verify with manual testing.
+- **A window dies between listing it and asking about it.** Every X tree walk is a TOCTOU, and libX11's default error handler prints the protocol error and calls `exit(1)` (`src/XError.c: _XDefaultError`) -- a C `exit`, invisible to Python, so `try/except` around the walk catches nothing and the process just vanishes with status 1. Install `XSetErrorHandler` and return 0; the calls already answer 0 for "gone" (see `traywin.lib`).
+- **The bar dies with the status command.** i3bar never respawns a `status_command`, and `Error: status_command process exited unexpectedly` is all it prints, so a throw from `render()` is fatal until the next reload. Catch it, print the traceback to stderr (i3 logs it), and paint a fallback line.
 
 ### i3 Specifics
 

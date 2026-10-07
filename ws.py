@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import tomllib
+import traceback
 from datetime import datetime
 from select import select
 
@@ -858,6 +859,7 @@ def main():
     t.start()
     sample_status()
     traywin.set_visible(not _show_ws)
+    traywin.reserved_width()  # measure the tray before the first frame needs it
     st = threading.Thread(target=_bg_status, daemon=True)
     st.start()
 
@@ -865,7 +867,14 @@ def main():
 
     def emit():
         nonlocal first
-        line = json.dumps(render(ROW_KEYS), ensure_ascii=False)
+        try:
+            line = json.dumps(render(ROW_KEYS), ensure_ascii=False)
+        except Exception:
+            # i3bar never respawns a status command, so a throw from here is the
+            # end of the bar until the next reload. Paint a plain line instead
+            # and leave the traceback in i3's log.
+            traceback.print_exc()
+            line = json.dumps([{"full_text": "ws.py: error, see i3 log"}])
         if not first:
             line = "," + line
         sys.stdout.write(line + "\n")

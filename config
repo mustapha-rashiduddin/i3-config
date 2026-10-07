@@ -4,6 +4,11 @@ font pango:monospace 14
 
 exec --no-startup-id dex --autostart --environment i3
 exec --no-startup-id xss-lock --transfer-sleep-lock -- i3lock --nofork
+# XSettings manager. GTK4 reads Net/IconThemeName from here and from nowhere
+# else, so this is the only way to reach Nautilus's icon theme on bare i3.
+# config-manager/theme.sh rewrites the file and SIGHUPs the daemon to switch a
+# running Nautilus live. Started early so every GTK app sees it.
+exec --no-startup-id xsettingsd -c $HOME/.config/config-manager/xsettingsd.conf
 exec --no-startup-id feh --bg-fill /run/current-system/sw/share/backgrounds/nixos/nix-wallpaper-simple-dark-gray.png
 
 # NetworkManager is the most popular way to manage wireless networks on Linux,

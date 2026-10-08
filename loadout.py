@@ -98,6 +98,37 @@ class LoadoutError(RuntimeError):
     pass
 
 
+class _TolerantWriter:
+    """A std stream that can be closed underneath us.
+
+    `load` is typed in a terminal that usually lives on one of the loadout's own
+    target workspaces, so the loadout kills that terminal as part of locking.
+    i3 kills st, the pty slave goes away, and every later write to stdout or
+    stderr -- including CPython's own exit-time flush -- comes back as EIO.
+    That is not a cosmetic problem: an unhandled OSError part way through the
+    launch aborts the remaining entries, so the browser appears and the
+    terminals never do. Output is a diagnostic here, never a result.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def write(self, data: str) -> int:
+        try:
+            return self._stream.write(data)
+        except (OSError, ValueError):
+            return len(data)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
 @dataclass(frozen=True)
 class Entry:
     ident: str
@@ -522,10 +553,11 @@ def browser_scroll_expr(scroll: int | str) -> str:
 
     A bare int is an absolute pixel offset; a string like "55%" is a fraction
     of the scrollable height, which is what you normally want for reading text.
-    Returns JSON {top, want, max}: the scrollTop actually reached, the target
-    (clamped to the page height), and the scrollable height — the caller
-    retries until top == want on a non-empty page, so late-loading images that
-    grow the page converge on the right fraction.
+    Returns JSON {top, want, max, ready}: the scrollTop actually reached, the
+    target (clamped to the page height), the scrollable height, and whether the
+    document has finished loading. The caller retries until top == want on a
+    loaded page, so late-loading images that grow the page converge on the
+    right fraction.
     """
     target = str(scroll) if isinstance(scroll, int) else f"Math.round(max * {float(scroll.strip().rstrip('%')) / 100.0:g})"
     return (
@@ -534,7 +566,8 @@ def browser_scroll_expr(scroll: int | str) -> str:
         "  const max = r.scrollHeight - r.clientHeight;"
         f"  r.scrollTop = {target};"
         f"  const want = Math.min({target}, max);"
-        "  return JSON.stringify({top: r.scrollTop, want: want, max: max});"
+        "  return JSON.stringify({top: r.scrollTop, want: want, max: max, "
+        "ready: document.readyState === 'complete'});"
         "})()"
     )
 
@@ -693,20 +726,48 @@ def file_page_scroll_positions(port: str, *, include_web: bool = False
 def reload_file_pages(port: str, enabled: bool | None = None,
                       positions: dict[str, tuple[float, float]] | None = None, *,
                       include_web: bool = False) -> None:
-    """Reload app pages, preserve scroll, and verify local-file Dark Reader state."""
+    """Reload app pages, preserve scroll, and verify local-file Dark Reader state.
+
+    Bounded by one deadline for the whole sweep, and chatty about it: Chrome
+    accepts Page.reload for a tab it has frozen (a backgrounded or occluded
+    window) and never performs it, so the per-page wait below can legitimately
+    run to its full budget. With several tabs open that used to be minutes of
+    silence, which reads as a hang rather than as work.
+    """
     try:
         targets = json.loads(urllib.request.urlopen(
             f"http://127.0.0.1:{port}/json", timeout=1.5).read())
     except Exception as exc:
         raise LoadoutError("could not enumerate Chrome pages for Dark Reader") from exc
+    pages = [t for t in targets
+             if t.get("type") == "page" and t.get("webSocketDebuggerUrl")
+             and (t.get("url", "").startswith("file:")
+                  or (include_web and t.get("url", "").startswith(("http://", "https://"))))]
+    budget = time.monotonic() + DARK_READER_TIMEOUT
     failures: list[str] = []
-    for target in targets:
+    unrestored: list[str] = []
+
+    def note(target: dict[str, Any]) -> None:
+        # A file page that Dark Reader will not darken is a real failure. A web
+        # page whose scroll could not be restored is cosmetic: Dark Reader was
+        # already switched and verified before this ran.
+        url = target.get("url") or "local page"
+        if url.startswith("file:"):
+            failures.append(url)
+        else:
+            unrestored.append(url)
+            print(f"chrome: scroll not restored in {url}",
+                  file=sys.stderr, flush=True)
+
+    for index, target in enumerate(pages, start=1):
+        if time.monotonic() >= budget:
+            for skipped in pages[index - 1:]:
+                note(skipped)
+            break
         url = target.get("url", "")
         is_file = url.startswith("file:")
-        allowed = is_file or (include_web and url.startswith(("http://", "https://")))
-        if (target.get("type") != "page" or not allowed
-                or not target.get("webSocketDebuggerUrl")):
-            continue
+        print(f"chrome page {index}/{len(pages)}: {url}",
+              file=sys.stderr, flush=True)
         sock: socket.socket | None = None
         request_id = 0
         try:
@@ -731,6 +792,19 @@ def reload_file_pages(port: str, enabled: bool | None = None,
                 scroll_x = 0
             if not isinstance(scroll_y, (int, float)):
                 scroll_y = 0
+            if not is_file:
+                # A web page needs no reload. Dark Reader's storage was already
+                # switched and its worker force-restarted by the caller, so the
+                # extension re-injects by itself; reloading here only re-fetched
+                # the page, and on a backgrounded or occluded tab Chrome accepts
+                # Page.reload and never performs it -- which is what used to
+                # spend the whole budget per tab. Put the reader back and move on.
+                request_id += 1
+                _, buf = cdp_request(
+                    sock, buf, request_id, "Runtime.evaluate",
+                    {"expression": f"window.scrollTo({scroll_x:g}, {scroll_y:g})"},
+                )
+                continue
             request_id += 1
             frame_tree, buf = cdp_request(
                 sock,
@@ -743,7 +817,9 @@ def reload_file_pages(port: str, enabled: bool | None = None,
                 raise LoadoutError("Chrome DevTools returned no document loader")
             request_id += 1
             _, buf = cdp_request(sock, buf, request_id, "Page.reload")
-            deadline = time.monotonic() + DARK_READER_TIMEOUT
+            # One deadline for the page, and never past the sweep's own budget:
+            # Chrome may accept the reload and never perform it.
+            deadline = min(time.monotonic() + DARK_READER_TIMEOUT, budget)
             while time.monotonic() < deadline:
                 request_id += 1
                 try:
@@ -786,18 +862,18 @@ def reload_file_pages(port: str, enabled: bool | None = None,
                     break
                 time.sleep(0.1)
             else:
-                failures.append(target.get("url") or "local page")
+                note(target)
         except (LoadoutError, OSError, ConnectionError, ValueError):
-            failures.append(target.get("url") or "local page")
+            note(target)
         finally:
             if sock is not None:
                 sock.close()
     if failures:
-        pages = ", ".join(failures)
+        named = ", ".join(failures)
         if enabled is None:
-            raise LoadoutError(f"Dark Reader did not finish reloading {pages}")
+            raise LoadoutError(f"Dark Reader did not finish reloading {named}")
         mode = "dark" if enabled else "light"
-        raise LoadoutError(f"Dark Reader did not make {pages} {mode}")
+        raise LoadoutError(f"Dark Reader did not make {named} {mode}")
 
 
 def ensure_dark_reader_file_access(profile: Path, *, wait: bool = False,
@@ -1202,7 +1278,12 @@ def scroll_site(profile: Path, entry: Entry) -> None:
                              if t.get("type") == "page" and t.get("webSocketDebuggerUrl")), None)
             if page is not None:
                 state = chrome_scroll(page["webSocketDebuggerUrl"], expression)
-                if state is not None and state.get("max"):
+                # `ready`, not `max`: a page with nothing to scroll reports max 0
+                # forever, and treating that as "not there yet" spent the whole
+                # timeout on any entry whose scroll is 0% -- or on any page whose
+                # tab Chrome has frozen. want is already clamped, so top == want
+                # on a loaded page means we are done.
+                if state is not None and state.get("ready") is True:
                     top = int(round(state.get("top") or 0))
                     want = int(state.get("want") or 0)
                     if abs(top - want) <= 2:
@@ -2033,6 +2114,9 @@ def main(argv: list[str] | None = None) -> int:
     # SIGHUP this process mid-`kill_windows`. The controller must outlive its
     # own terminal, so ignore the hangup for the whole run.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    # The terminal `load` was typed in is a likely casualty of this very run.
+    sys.stdout = _TolerantWriter(sys.stdout)
+    sys.stderr = _TolerantWriter(sys.stderr)
     argv = list(sys.argv[1:] if argv is None else argv)
     invoked_as = Path(sys.argv[0]).name
     if invoked_as == "lock":

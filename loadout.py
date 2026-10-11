@@ -92,6 +92,11 @@ BROWSER_BIN = "google-chrome-stable"
 SCROLL_TIMEOUT = 10.0
 DARK_READER_ID = "eimadpbcbfnmbkopoojfekhnkhdbieeh"
 DARK_READER_TIMEOUT = 12.0
+# True when Dark Reader is currently styling this document.
+DARK_READER_ACTIVE = (
+    "(document.documentElement.hasAttribute('data-darkreader-mode') || "
+    "document.querySelector('style.darkreader, link.darkreader') !== null)"
+)
 
 
 class LoadoutError(RuntimeError):
@@ -726,13 +731,17 @@ def file_page_scroll_positions(port: str, *, include_web: bool = False
 def reload_file_pages(port: str, enabled: bool | None = None,
                       positions: dict[str, tuple[float, float]] | None = None, *,
                       include_web: bool = False) -> None:
-    """Reload app pages, preserve scroll, and verify local-file Dark Reader state.
+    """Reload app pages, preserve scroll, and verify Dark Reader state.
+
+    A web page that already matches `enabled` is left alone and only has its
+    scroll put back; one that does not match is reloaded, because a page on a
+    hidden workspace is never re-themed by Dark Reader's own worker restart.
 
     Bounded by one deadline for the whole sweep, and chatty about it: Chrome
     accepts Page.reload for a tab it has frozen (a backgrounded or occluded
-    window) and never performs it, so the per-page wait below can legitimately
-    run to its full budget. With several tabs open that used to be minutes of
-    silence, which reads as a hang rather than as work.
+    window) and may never perform it, so the per-page wait below can
+    legitimately run to its full budget. With several tabs open that used to be
+    minutes of silence, which reads as a hang rather than as work.
     """
     try:
         targets = json.loads(urllib.request.urlopen(
@@ -749,14 +758,15 @@ def reload_file_pages(port: str, enabled: bool | None = None,
 
     def note(target: dict[str, Any]) -> None:
         # A file page that Dark Reader will not darken is a real failure. A web
-        # page whose scroll could not be restored is cosmetic: Dark Reader was
-        # already switched and verified before this ran.
+        # page that did not come back in the requested theme is not: the worker
+        # storage was already switched and verified before this ran, so the page
+        # is only stale, and it re-themes itself when its workspace is shown.
         url = target.get("url") or "local page"
         if url.startswith("file:"):
             failures.append(url)
         else:
             unrestored.append(url)
-            print(f"chrome: scroll not restored in {url}",
+            print(f"chrome: theme or scroll not applied in {url}",
                   file=sys.stderr, flush=True)
 
     for index, target in enumerate(pages, start=1):
@@ -793,18 +803,35 @@ def reload_file_pages(port: str, enabled: bool | None = None,
             if not isinstance(scroll_y, (int, float)):
                 scroll_y = 0
             if not is_file:
-                # A web page needs no reload. Dark Reader's storage was already
-                # switched and its worker force-restarted by the caller, so the
-                # extension re-injects by itself; reloading here only re-fetched
-                # the page, and on a backgrounded or occluded tab Chrome accepts
-                # Page.reload and never performs it -- which is what used to
-                # spend the whole budget per tab. Put the reader back and move on.
+                # A web page is not reloaded just because the theme changed --
+                # Dark Reader's storage was switched and its worker restarted by
+                # the caller, so a *visible* page re-injects on its own.
+                #
+                # A page whose window sits on another workspace cannot. i3
+                # unmaps it, Chrome reports document.visibilityState "hidden",
+                # and Dark Reader's service worker does not touch a hidden
+                # document: no style element, no data-darkreader-mode. Measured
+                # on a loadout browser parked on a hidden workspace -- after
+                # `chrome-theme dark` the worker's storage read back enabled
+                # true, while the page itself stayed unthemed until the
+                # workspace was shown. Page.reload *is* performed on that page
+                # (the loader id changes), so reload it when it disagrees with
+                # the requested theme, and skip the reload when it already
+                # agrees -- otherwise every switch would re-fetch the page.
                 request_id += 1
-                _, buf = cdp_request(
+                state, buf = cdp_request(
                     sock, buf, request_id, "Runtime.evaluate",
-                    {"expression": f"window.scrollTo({scroll_x:g}, {scroll_y:g})"},
+                    {"expression": DARK_READER_ACTIVE, "returnByValue": True},
                 )
-                continue
+                if state.get("result", {}).get("value") is enabled:
+                    request_id += 1
+                    _, buf = cdp_request(
+                        sock, buf, request_id, "Runtime.evaluate",
+                        {"expression": f"window.scrollTo({scroll_x:g}, {scroll_y:g})"},
+                    )
+                    continue
+                # Falls through to the reload below, which re-checks the
+                # loader and waits for Dark Reader to re-inject.
             request_id += 1
             frame_tree, buf = cdp_request(
                 sock,
@@ -838,8 +865,7 @@ def reload_file_pages(port: str, enabled: bool | None = None,
                         {
                             "expression": (
                                 "({ready: document.readyState === 'complete', "
-                                "active: document.documentElement.hasAttribute('data-darkreader-mode') || "
-                                "document.querySelector('style.darkreader, link.darkreader') !== null})"
+                                f"active: {DARK_READER_ACTIVE}}})"
                             ),
                             "returnByValue": True,
                         },
@@ -848,7 +874,7 @@ def reload_file_pages(port: str, enabled: bool | None = None,
                     time.sleep(0.1)
                     continue
                 value = state.get("result", {}).get("value")
-                expected = enabled if is_file else None
+                expected = enabled
                 if (isinstance(value, dict) and value.get("ready") is True
                         and (expected is None or value.get("active") is expected)):
                     request_id += 1

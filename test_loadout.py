@@ -1016,6 +1016,86 @@ class DarkReaderTests(unittest.TestCase):
         ])
         self.assertEqual(requests[-1][1]["expression"], "window.scrollTo(17, 2500)")
 
+    def test_reload_skips_web_page_already_in_the_requested_theme(self):
+        target = {
+            "type": "page",
+            "url": "https://example.com/",
+            "webSocketDebuggerUrl": "ws://target",
+        }
+        response = types.SimpleNamespace(read=lambda: json.dumps([target]).encode())
+        requests = []
+
+        class FakeSocket:
+            def close(self):
+                pass
+
+        def request(sock, buf, request_id, method, params=None, **kwargs):
+            requests.append((method, params))
+            if method == "Runtime.evaluate":
+                expression = params["expression"]
+                if expression == loadout.DARK_READER_ACTIVE:
+                    return {"result": {"value": True}}, b""
+                if expression.startswith("({x:"):
+                    return {"result": {"value": {"x": 3, "y": 40}}}, b""
+                return {}, b""
+            return {}, b""
+
+        with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+             patch.object(loadout, "ws_connect", return_value=(FakeSocket(), b"")), \
+             patch.object(loadout, "cdp_request", side_effect=request):
+            loadout.reload_file_pages("9222", True, include_web=True)
+
+        self.assertEqual([method for method, _ in requests], [
+            "Runtime.evaluate",
+            "Runtime.evaluate",
+            "Runtime.evaluate",
+        ])
+        self.assertNotIn("Page.reload", [method for method, _ in requests])
+        self.assertEqual(requests[-1][1]["expression"], "window.scrollTo(3, 40)")
+
+    def test_reload_reloads_hidden_web_page_left_in_the_old_theme(self):
+        # Dark Reader's worker does not re-inject into a document whose window
+        # is unmapped, so a page on another workspace keeps the old theme until
+        # that workspace is shown. It must be reloaded instead of trusted.
+        target = {
+            "type": "page",
+            "url": "https://example.com/",
+            "webSocketDebuggerUrl": "ws://target",
+        }
+        response = types.SimpleNamespace(read=lambda: json.dumps([target]).encode())
+        requests = []
+        frame_reads = 0
+
+        class FakeSocket:
+            def close(self):
+                pass
+
+        def request(sock, buf, request_id, method, params=None, **kwargs):
+            nonlocal frame_reads
+            requests.append((method, params))
+            if method == "Runtime.evaluate":
+                expression = params["expression"]
+                if expression == loadout.DARK_READER_ACTIVE:
+                    return {"result": {"value": False}}, b""
+                if expression.startswith("({x:"):
+                    return {"result": {"value": {"x": 0, "y": 0}}}, b""
+                if expression.startswith("({ready:"):
+                    return {"result": {"value": {"ready": True, "active": True}}}, b""
+                return {}, b""
+            if method == "Page.getFrameTree":
+                frame_reads += 1
+                loader = "new" if frame_reads >= 3 else "old"
+                return {"frameTree": {"frame": {"loaderId": loader}}}, b""
+            return {}, b""
+
+        with patch.object(loadout.urllib.request, "urlopen", return_value=response), \
+             patch.object(loadout, "ws_connect", return_value=(FakeSocket(), b"")), \
+             patch.object(loadout, "cdp_request", side_effect=request), \
+             patch.object(loadout.time, "sleep"):
+            loadout.reload_file_pages("9222", True, include_web=True)
+
+        self.assertIn("Page.reload", [method for method, _ in requests])
+
     def test_reload_file_page_reports_setup_reload_failure(self):
         target = {
             "type": "page",

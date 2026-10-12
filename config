@@ -3,6 +3,11 @@ font pango:monospace 14
 #font pango:Ac437 IBM VGA 8x16 18
 
 exec --no-startup-id dex --autostart --environment i3
+# Compositor. Without one, every X client draws straight into the front
+# buffer with nothing synced to vblank, so a workspace switch tears where
+# the scanout beam sits. A compositor makes it a single atomic page flip.
+# Started first, before anything else in this session draws a pixel.
+exec --no-startup-id picom --config ~/.config/i3/picom.conf
 exec --no-startup-id xss-lock --transfer-sleep-lock -- i3lock --nofork
 # XSettings manager. GTK4 reads Net/IconThemeName from here and from nowhere
 # else, so this is the only way to reach Nautilus's icon theme on bare i3.
